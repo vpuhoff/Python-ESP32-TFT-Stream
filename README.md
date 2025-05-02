@@ -36,15 +36,8 @@ This project demonstrates streaming a selected region of a PC screen in real-tim
     * `numpy`: For efficient numerical operations (used in color correction).
     * *(Optional, for specific window capture):* `pywin32` (Windows), `python-xlib` (Linux), `pyobjc-core` & `pyobjc-framework-Quartz` (macOS).
 
-    Create a `requirements.txt` file in the server directory with the following content:
-    ```
-    mss
-    Pillow
-    numpy
-    ```
-    Then install using:
     ```bash
-    pip install -r requirements.txt
+    pip install -r requirements.txt or pipenv install
     ```
 
 ### ESP32 (Client)
@@ -58,8 +51,8 @@ This project demonstrates streaming a selected region of a PC screen in real-tim
 
 1.  **Clone Repository:**
     ```bash
-    git clone <your-repository-url>
-    cd <your-repository-folder>
+    git clone https://github.com/vpuhoff/Python-ESP32-TFT-Stream.git esp32
+    cd esp32
     ```
 
 2.  **Configure TFT_eSPI:**
