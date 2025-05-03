@@ -8,6 +8,8 @@ mss = "*"
 pillow = "*"
 pywin32 = "*"
 numpy = "*"
+psutil = "*"
+py-cpuinfo = "*"
 
 [dev-packages]
 
