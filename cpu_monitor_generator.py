@@ -14,7 +14,7 @@ except ImportError:
     _CPUINFO_AVAILABLE = False
 
 # --- Конфигурация по умолчанию ---
-DEFAULT_RESOLUTION = (600, 400)
+DEFAULT_RESOLUTION = (320, 240)
 DEFAULT_HISTORY_LENGTH = 60 # Должно совпадать с GRAPH_POINTS ниже
 DEFAULT_UPDATE_INTERVAL = 0.5 # Секунды
 DEFAULT_FONT_PATH = "arial.ttf"
@@ -110,7 +110,7 @@ class CpuMonitorGenerator:
 
     def _fetch_cpu_name(self):
         """Пытается получить маркетинговое имя ЦП."""
-        name = f"Logical Cores: {self.num_cores}" # Имя по умолчанию
+        name = f"Ядер: {self.num_cores}" # Имя по умолчанию
         if _CPUINFO_AVAILABLE:
             try:
                 info = cpuinfo.get_cpu_info()
@@ -184,13 +184,14 @@ class CpuMonitorGenerator:
         draw.text((70, title_y + 4), self._cpu_name, fill=self._colors["foreground"], font=self._font_sub)
 
         # 3. Подзаголовок
-        subtitle_y = title_y + TITLE_FONT_SIZE + 10
-        subtitle_text_left = f"% использования более {self._graph_points} секунд"
-        subtitle_text_right = "100%"
-        draw.text((10, subtitle_y), subtitle_text_left, fill=self._colors["foreground"], font=self._font_sub)
-        right_text_bbox = draw.textbbox((0,0), subtitle_text_right, font=self._font_sub)
-        right_text_width = right_text_bbox[2] - right_text_bbox[0]
-        draw.text((width - right_text_width - 10, subtitle_y), subtitle_text_right, fill=self._colors["foreground"], font=self._font_sub)
+        subtitle_y = title_y + 5
+        # subtitle_y = title_y + TITLE_FONT_SIZE + 10
+        # subtitle_text_left = f"% использования более {self._graph_points} секунд"
+        # subtitle_text_right = "100%"
+        # draw.text((10, subtitle_y), subtitle_text_left, fill=self._colors["foreground"], font=self._font_sub)
+        # right_text_bbox = draw.textbbox((0,0), subtitle_text_right, font=self._font_sub)
+        # right_text_width = right_text_bbox[2] - right_text_bbox[0]
+        # draw.text((width - right_text_width - 10, subtitle_y), subtitle_text_right, fill=self._colors["foreground"], font=self._font_sub)
 
         # 4. Сетка графиков
         grid_area_y_start = subtitle_y + SUBTITLE_FONT_SIZE + 15

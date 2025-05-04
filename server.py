@@ -7,6 +7,7 @@ import io # Для работы с байтами как с файлом
 import numpy as np # Для работы с массивами
 from bios_drawer import draw_bios_on_image, DEFAULT_BIOS_RESOLUTION
 from cpu_monitor_generator import CpuMonitorGenerator
+from prometheus_monitor_generator import COLORS, RESOLUTION, PrometheusMonitorGenerator
 
 # --- Настройки ---
 ESP32_PORT = 8888
@@ -145,26 +146,30 @@ try:
     conn, addr = server_socket.accept()
     print(f"[*] ESP32 подключен: {addr}")
 
-    with CpuMonitorGenerator() as cpu_monitor:
+    # with CpuMonitorGenerator() as cpu_monitor:
+    with PrometheusMonitorGenerator() as monitor:
         with mss.mss() as sct: # Инициализация захвата экрана
             while True:
                 start_time = time.time()
 
-                # 1. Захват экрана
-                try:
-                    sct_img_bgra = sct.grab(CAPTURE_REGION) # Захват в формате BGRA
-                    # Конвертируем в Pillow Image (RGB)
-                    curr_image_full = Image.frombytes('RGB', (sct_img_bgra.width, sct_img_bgra.height), sct_img_bgra.rgb)
-                except mss.ScreenShotError as e:
-                    print(f"Ошибка захвата экрана: {e}")
-                    time.sleep(1)
-                    continue
-                # 1. Рисуем BIOS на пустом изображении
+                # 1a. Захват экрана
+                # try:
+                #     sct_img_bgra = sct.grab(CAPTURE_REGION) # Захват в формате BGRA
+                #     # Конвертируем в Pillow Image (RGB)
+                #     curr_image_full = Image.frombytes('RGB', (sct_img_bgra.width, sct_img_bgra.height), sct_img_bgra.rgb)
+                # except mss.ScreenShotError as e:
+                #     print(f"Ошибка захвата экрана: {e}")
+                #     time.sleep(1)
+                #     continue
+                # 1b. Рисуем BIOS на пустом изображении
                 # width, height = DEFAULT_BIOS_RESOLUTION
                 # my_image = Image.new('RGB', (width, height))
                 # curr_image_full = draw_bios_on_image(my_image)
-                curr_image_full = Image.new('RGB', cpu_monitor.resolution)
-                cpu_monitor.draw_frame(curr_image_full)
+                # 1c. Рисуем CPU монитор на пустом изображении
+                # curr_image_full = Image.new('RGB', cpu_monitor.resolution)
+                # cpu_monitor.draw_frame(curr_image_full)
+                curr_image_full = Image.new('RGB', RESOLUTION, color=COLORS["background"])
+                monitor.draw_frame(curr_image_full)
 
                 # 2. Масштабирование до целевого разрешения
                 curr_image_resized = curr_image_full.resize((TARGET_WIDTH, TARGET_HEIGHT), Image.Resampling.LANCZOS) # Или Image.BILINEAR для сглаживания
