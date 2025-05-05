@@ -169,7 +169,7 @@ try:
                 # curr_image_full = Image.new('RGB', cpu_monitor.resolution)
                 # cpu_monitor.draw_frame(curr_image_full)
                 curr_image_full = Image.new('RGB', RESOLUTION, color=COLORS["background"])
-                monitor.draw_frame(curr_image_full)
+                monitor.generate_image_frame(curr_image_full)
 
                 # 2. Масштабирование до целевого разрешения
                 curr_image_resized = curr_image_full.resize((TARGET_WIDTH, TARGET_HEIGHT), Image.Resampling.LANCZOS) # Или Image.BILINEAR для сглаживания
