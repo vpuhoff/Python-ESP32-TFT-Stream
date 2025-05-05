@@ -2,6 +2,8 @@
 
 This project demonstrates streaming a selected region of a PC screen in real-time to an ESP32-C3 microcontroller equipped with a TFT display. It uses a Python server on the PC for capturing and processing, and an Arduino sketch on the ESP32-C3 for receiving and rendering the stream over a TCP connection. Differential updates are used to minimize latency and bandwidth usage, and server-side color correction options are included for better display fidelity.
 
+* Wiki: [https://deepwiki.com/vpuhoff/Python-ESP32-TFT-Stream](https://deepwiki.com/vpuhoff/Python-ESP32-TFT-Stream/1-overview)
+
 ## Features
 
 * Streams a selected screen region from a PC (Windows/macOS/Linux).
