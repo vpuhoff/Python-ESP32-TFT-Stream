@@ -89,49 +89,60 @@ def image_to_rgb565_bytes(img: Image.Image):
 
 def find_dirty_rects(img_prev: Image.Image | None, img_curr: Image.Image, threshold=10):
     """
-    Находит измененные прямоугольники.
-    Простой алгоритм: находит ОДИН большой прямоугольник, охватывающий все изменения.
+    Находит измененные прямоугольники с использованием NumPy для ускорения.
+    Возвращает один большой прямоугольник, охватывающий все изменения.
     """
     diff_start_time = time.monotonic()
-    if img_prev is None:
+
+    if img_prev is None or img_prev.size != img_curr.size:
         FRAME_PROCESSING_TIME.labels(stage='diff_calculation').observe(time.monotonic() - diff_start_time)
         yield (0, 0, img_curr.width, img_curr.height)
         return
 
-    if img_prev.size != img_curr.size:
+    # Преобразуем изображения Pillow в массивы NumPy
+    # Убедимся, что изображения в режиме RGB для корректного сравнения каналов
+    if img_prev.mode != 'RGB':
+        img_prev_rgb = img_prev.convert('RGB')
+    else:
+        img_prev_rgb = img_prev
+
+    if img_curr.mode != 'RGB':
+        img_curr_rgb = img_curr.convert('RGB')
+    else:
+        img_curr_rgb = img_curr
+        
+    arr_prev = np.array(img_prev_rgb, dtype=np.int16) # Используем int16 чтобы избежать переполнения при вычитании
+    arr_curr = np.array(img_curr_rgb, dtype=np.int16)
+
+    # Вычисляем абсолютную разницу по каждому каналу, затем суммируем разницы
+    # Это эквивалентно abs(r1-r2) + abs(g1-g2) + abs(b1-b2)
+    abs_diff_arr = np.sum(np.abs(arr_curr - arr_prev), axis=2)
+
+    # Находим пиксели, где суммарная разница превышает порог
+    changed_pixels_mask = abs_diff_arr > threshold
+
+    # Находим координаты изменившихся пикселей
+    # np.where возвращает кортеж массивов (один для каждой размерности)
+    changed_y_coords, changed_x_coords = np.where(changed_pixels_mask)
+
+    if changed_y_coords.size > 0: # Если есть хотя бы один измененный пиксель
+        min_x = np.min(changed_x_coords)
+        max_x = np.max(changed_x_coords)
+        min_y = np.min(changed_y_coords)
+        max_y = np.max(changed_y_coords)
+
+        rect_w = int(max_x - min_x + 1) # Преобразуем в int, т.к. numpy может вернуть свои типы
+        rect_h = int(max_y - min_y + 1)
+
         FRAME_PROCESSING_TIME.labels(stage='diff_calculation').observe(time.monotonic() - diff_start_time)
-        yield (0, 0, img_curr.width, img_curr.height)
+        yield (int(min_x), int(min_y), rect_w, rect_h)
+    else:
+        # Изменений не найдено
+        FRAME_PROCESSING_TIME.labels(stage='diff_calculation').observe(time.monotonic() - diff_start_time)
+        # Ничего не возвращаем, или можно вернуть специальный флаг/пустой кортеж,
+        # в зависимости от того, как вызывающий код это обрабатывает.
+        # Текущая логика ожидает, что если ничего не yield, то dirty_rects будет пустым.
         return
-
-    pixels_prev = img_prev.load()
-    pixels_curr = img_curr.load()
-    width, height = img_curr.size
-
-    min_x, min_y = width, height
-    max_x, max_y = -1, -1
-    changed = False
-
-    for y_coord in range(height): # Изменено имя переменной
-        for x_coord in range(width): # Изменено имя переменной
-            r1, g1, b1 = pixels_prev[x_coord, y_coord]
-            r2, g2, b2 = pixels_curr[x_coord, y_coord]
-            diff = abs(r1 - r2) + abs(g1 - g2) + abs(b1 - b2)
-            if diff > threshold:
-                changed = True
-                if x_coord < min_x: min_x = x_coord
-                if y_coord < min_y: min_y = y_coord
-                if x_coord > max_x: max_x = x_coord
-                if y_coord > max_y: max_y = y_coord
-
-    if changed:
-        rect_w = max_x - min_x + 1
-        rect_h = max_y - min_y + 1
-        if rect_w > 0 and rect_h > 0:
-            FRAME_PROCESSING_TIME.labels(stage='diff_calculation').observe(time.monotonic() - diff_start_time)
-            yield (min_x, min_y, rect_w, rect_h)
-    else: # Если изменений нет, все равно фиксируем время
-        FRAME_PROCESSING_TIME.labels(stage='diff_calculation').observe(time.monotonic() - diff_start_time)
-
 
 def pack_update_packet(x, y, w, h, data: bytes):
     """
