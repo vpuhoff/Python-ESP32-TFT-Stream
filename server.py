@@ -57,7 +57,7 @@ WB_SCALE = (0.85, 0.95, 0.75)
 
 # --- Настройки для динамического Threshold ---
 TARGET_FPS = 10.0
-MIN_DIRTY_RECT_THRESHOLD = 20
+MIN_DIRTY_RECT_THRESHOLD = 5
 MAX_DIRTY_RECT_THRESHOLD = 80
 THRESHOLD_ADJUSTMENT_STEP_UP = 10   
 THRESHOLD_ADJUSTMENT_STEP_DOWN = 5  
@@ -72,7 +72,7 @@ FRAMES_QUEUE_MAX_SIZE = 5
 GENERATOR_LOW_WATER_MARK = 2 
 
 # Выбор источника изображения 
-IMAGE_SOURCE_MODE = "SCREEN_CAPTURE" 
+IMAGE_SOURCE_MODE = "SCREEN_CAPTURE" # "PROMETHEUS_MONITOR" 
 
 frames_queue = queue.Queue(maxsize=FRAMES_QUEUE_MAX_SIZE)
 stop_event = threading.Event() 
@@ -247,137 +247,150 @@ def frame_generator_thread_func(
 
 # --- Поток 2: Обработчик и Отправщик Кадров ---
 def frame_consumer_thread_func(client_conn):
-    global current_dynamic_threshold 
+    global current_dynamic_threshold
     global frame_processing_times_history
 
     print("[ConsumerThread] Запущен.")
-    prev_processed_image = None 
+    prev_processed_image = None
 
     CURRENT_DYNAMIC_THRESHOLD_VALUE.set(current_dynamic_threshold)
-    CONSUMER_CALCULATED_FPS.set(0) # Начальное значение для FPS
+    CONSUMER_CALCULATED_FPS.set(0)
 
     while not stop_event.is_set():
         try:
             raw_frame = frames_queue.get(timeout=0.1)
-            QUEUE_SIZE_FRAMES.observe(frames_queue.qsize()) 
+            QUEUE_SIZE_FRAMES.observe(frames_queue.qsize())
 
-            actual_processing_start_time = time.monotonic() 
-            
+            actual_processing_start_time = time.monotonic()
+
             resize_start_time = time.monotonic()
             curr_image_resized = raw_frame.resize((TARGET_WIDTH, TARGET_HEIGHT), Image.Resampling.LANCZOS)
             FRAME_PROCESSING_TIME.labels(stage='resize_thread').observe(time.monotonic() - resize_start_time)
 
-            dirty_rects = list(find_dirty_rects(prev_processed_image, curr_image_resized, threshold=current_dynamic_threshold)) 
-            
-            total_dirty_rects_send_time_start = 0 
-            if dirty_rects: 
-                total_dirty_rects_send_time_start = time.monotonic()
-            
-            total_chunks_current_frame = 0
+            dirty_rects = list(find_dirty_rects(prev_processed_image, curr_image_resized, threshold=current_dynamic_threshold))
+
+            total_dirty_rects_send_time_start = 0
+            socket_error_occurred = False # Флаг для отслеживания ошибки сокета в этой итерации
+
             if dirty_rects:
+                total_dirty_rects_send_time_start = time.monotonic()
+
                 for (x, y, w, h) in dirty_rects:
-                    full_rect_data_size = w * h * 2 
+                    full_rect_data_size = w * h * 2
                     if full_rect_data_size > MAX_CHUNK_DATA_SIZE:
+                        # --- Логика чанкинга ---
                         bytes_per_row = w * 2
                         if bytes_per_row == 0: continue
                         if bytes_per_row > MAX_CHUNK_DATA_SIZE: continue
-                        
+
                         chunk_h = MAX_CHUNK_DATA_SIZE // bytes_per_row
                         if chunk_h == 0: chunk_h = 1
 
                         for current_y_offset in range(0, h, chunk_h):
                             actual_chunk_h = min(chunk_h, h - current_y_offset)
                             chunk_x, chunk_y, chunk_w = x, y + current_y_offset, w
-                            
+
                             current_chunk_crop_time_start = time.monotonic()
                             chunk_img = curr_image_resized.crop((chunk_x, chunk_y, chunk_x + chunk_w, chunk_y + actual_chunk_h))
                             FRAME_PROCESSING_TIME.labels(stage='chunking_and_crop_thread').observe(time.monotonic() - current_chunk_crop_time_start)
-                            
+
                             chunk_data_rgb565 = image_to_rgb565_bytes(chunk_img)
                             packet = pack_update_packet(chunk_x, chunk_y, chunk_w, actual_chunk_h, chunk_data_rgb565)
                             send_start_time = time.monotonic()
                             try:
                                 client_conn.sendall(packet)
                                 FRAME_PROCESSING_TIME.labels(stage='send_packet_thread').observe(time.monotonic() - send_start_time)
-                                total_chunks_current_frame += 1
+                                # total_chunks_current_frame += 1 # Перенесем инкремент ниже
                             except socket.error as e:
                                 print(f"[ConsumerThread] Ошибка отправки чанка: {e}")
-                                CONNECTION_ERRORS.inc(); stop_event.set(); break 
-                        if stop_event.is_set(): break 
-                    else: 
+                                CONNECTION_ERRORS.inc()
+                                socket_error_occurred = True # Устанавливаем флаг
+                                break # Выходим из внутреннего цикла (по чанкам)
+                        # --- Конец цикла по чанкам ---
+                        if socket_error_occurred: break # Если была ошибка в чанке, выходим и из внешнего цикла (по dirty_rects)
+
+                    else: # Если не чанкинг
                         current_region_crop_time_start = time.monotonic()
                         region_img = curr_image_resized.crop((x, y, x + w, y + h))
                         FRAME_PROCESSING_TIME.labels(stage='chunking_and_crop_thread').observe(time.monotonic() - current_region_crop_time_start)
-                        
+
                         region_data_rgb565 = image_to_rgb565_bytes(region_img)
                         packet = pack_update_packet(x, y, w, h, region_data_rgb565)
                         send_start_time = time.monotonic()
                         try:
                             client_conn.sendall(packet)
                             FRAME_PROCESSING_TIME.labels(stage='send_packet_thread').observe(time.monotonic() - send_start_time)
-                            total_chunks_current_frame += 1
                         except socket.error as e:
                             print(f"[ConsumerThread] Ошибка отправки: {e}")
-                            CONNECTION_ERRORS.inc(); stop_event.set(); break 
-            
-            if dirty_rects and total_dirty_rects_send_time_start > 0: 
-                DIRTY_RECTS_SEND_DURATION.observe(time.monotonic() - total_dirty_rects_send_time_start)
-            
-            if total_chunks_current_frame > 0: 
-                CHUNKS_PER_FRAME.observe(total_chunks_current_frame)
-            
-            if stop_event.is_set(): 
-                break
+                            CONNECTION_ERRORS.inc()
+                            socket_error_occurred = True # Устанавливаем флаг
+                            break # Выходим из цикла по dirty_rects
+                # --- Конец цикла по dirty_rects ---
 
-            prev_processed_image = curr_image_resized 
+                # Если произошла ошибка сокета, прерываем обработку этого кадра и переходим к except socket.error
+                if socket_error_occurred:
+                    raise socket.error("Socket error occurred during send operations for the frame")
+
+            # --- Этот код выполняется только если НЕ БЫЛО ошибки сокета ---
+            if dirty_rects: # Если вообще были изменения
+                 # Инкрементируем счетчик чанков здесь, если отправка прошла успешно
+                 # Примечание: CHUNKS_PER_FRAME считает количество успешных ОТПРАВОК, а не количество dirty_rects или логических чанков
+                 # Если нужна логика по чанкам, нужно инкрементить внутри циклов до sendall
+                 # Давайте пока считать количество dirty_rects, если они были успешно отправлены
+                 total_chunks_current_frame = len(dirty_rects) # Примерно
+                 CHUNKS_PER_FRAME.observe(total_chunks_current_frame)
+
+                 if total_dirty_rects_send_time_start > 0:
+                     DIRTY_RECTS_SEND_DURATION.observe(time.monotonic() - total_dirty_rects_send_time_start)
+
+            prev_processed_image = curr_image_resized
             FRAMES_PROCESSED.inc()
-            
+
             current_frame_actual_processing_time = time.monotonic() - actual_processing_start_time
             frame_processing_times_history.append(current_frame_actual_processing_time)
 
+            # --- Адаптация Threshold ---
             if len(frame_processing_times_history) == FPS_HISTORY_SIZE:
                 avg_processing_time = sum(frame_processing_times_history) / FPS_HISTORY_SIZE
-                current_fps = 0.0 # Значение по умолчанию
+                current_fps = 0.0
                 if avg_processing_time > 0:
                     current_fps = 1.0 / avg_processing_time
-                
-                CONSUMER_CALCULATED_FPS.set(current_fps) # Обновляем метрику FPS
+
+                CONSUMER_CALCULATED_FPS.set(current_fps)
 
                 hysteresis = TARGET_FPS * FPS_HYSTERESIS_FACTOR
-                old_threshold = current_dynamic_threshold 
-                if current_fps < TARGET_FPS - hysteresis and avg_processing_time > 0: # Добавил проверку avg_processing_time > 0
-                    current_dynamic_threshold = min(MAX_DIRTY_RECT_THRESHOLD, 
+                old_threshold = current_dynamic_threshold
+                if current_fps < TARGET_FPS - hysteresis and avg_processing_time > 0:
+                    current_dynamic_threshold = min(MAX_DIRTY_RECT_THRESHOLD,
                                                     current_dynamic_threshold + THRESHOLD_ADJUSTMENT_STEP_UP)
                 elif current_fps > TARGET_FPS + hysteresis:
-                    current_dynamic_threshold = max(MIN_DIRTY_RECT_THRESHOLD, 
+                    current_dynamic_threshold = max(MIN_DIRTY_RECT_THRESHOLD,
                                                     current_dynamic_threshold - THRESHOLD_ADJUSTMENT_STEP_DOWN)
-                
-                if old_threshold != current_dynamic_threshold: 
+
+                if old_threshold != current_dynamic_threshold:
                     CURRENT_DYNAMIC_THRESHOLD_VALUE.set(current_dynamic_threshold)
-            
-            frames_queue.task_done() 
+            # --- Конец адаптации ---
+
+            frames_queue.task_done()
             FRAME_PROCESSING_TIME.labels(stage='full_consumer_loop_thread').observe(time.monotonic() - actual_processing_start_time)
 
         except queue.Empty:
-            # Если очередь пуста, FPS может временно не обновляться, 
-            # но последнее известное значение останется в метрике.
-            # Можно добавить CONSUMER_CALCULATED_FPS.set(0) здесь, если нужно явно показывать 0 FPS при простое.
-            continue 
-        except socket.error as e: 
-            print(f"[ConsumerThread] Критическая ошибка сокета в основном цикле: {e}")
-            CONNECTION_ERRORS.inc()
-            stop_event.set()
-            CONSUMER_CALCULATED_FPS.set(0) # Сбрасываем FPS при ошибке
-            break 
+            continue
+        except socket.error as e:
+            # Этот блок ловит ошибку от sendall ИЛИ от raise socket.error(...)
+            print(f"[ConsumerThread] Завершение из-за ошибки сокета: {e}")
+            # CONNECTION_ERRORS уже увеличен в месте возникновения
+            CONSUMER_CALCULATED_FPS.set(0)
+            break # <-- Выходим из цикла while потока БЕЗ установки stop_event
         except Exception as e:
             print(f"[ConsumerThread] Неожиданная ошибка: {e}")
             import traceback
             traceback.print_exc()
-            stop_event.set() 
-            CONSUMER_CALCULATED_FPS.set(0) # Сбрасываем FPS при ошибке
-            break
+            CONSUMER_CALCULATED_FPS.set(0)
+            break # <-- Выходим из цикла while потока БЕЗ установки stop_event
 
     print("[ConsumerThread] Остановлен.")
+
 
 # --- Основная логика (main) ---
 def main():
@@ -389,53 +402,63 @@ def main():
 
     try:
         if IMAGE_SOURCE_MODE == "CPU_MONITOR":
-            cpu_monitor_instance = CpuMonitorGenerator() 
+            cpu_monitor_instance = CpuMonitorGenerator()
         elif IMAGE_SOURCE_MODE == "PROMETHEUS_MONITOR":
             prometheus_monitor_instance = PrometheusMonitorGenerator()
-        
+
         server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         server_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        server_socket.settimeout(1.0) 
+        server_socket.settimeout(1.0)
         server_socket.bind(('', ESP32_PORT))
         server_socket.listen(1)
         print(f"[*] Ожидание подключения ESP32 на порту {ESP32_PORT}...")
 
         conn_esp32 = None
-        generator_thread_instance = None 
-        consumer_thread_instance = None  
+        generator_thread_instance = None
+        consumer_thread_instance = None
 
         while not stop_event.is_set():
-            if conn_esp32 is None: 
+            if conn_esp32 is None: # Если нет активного соединения
+                # Очищаем очередь перед новым подключением
                 while not frames_queue.empty():
                     try: frames_queue.get_nowait(); frames_queue.task_done()
                     except queue.Empty: break
-                
+
+                # Ожидаем завершения ПРЕДЫДУЩИХ потоков перед созданием новых
                 if consumer_thread_instance and consumer_thread_instance.is_alive():
                     print("[MainLoop] Ожидание завершения предыдущего потока потребителя...")
+                    # Здесь не нужен stop_event, т.к. мы просто ждем завершения старого потока
                     consumer_thread_instance.join(timeout=1)
+                    if consumer_thread_instance.is_alive():
+                        print("[MainLoop] Предупреждение: Предыдущий потребитель не завершился!")
                 if generator_thread_instance and generator_thread_instance.is_alive():
                     print("[MainLoop] Ожидание завершения предыдущего потока генератора...")
                     generator_thread_instance.join(timeout=1)
+                    if generator_thread_instance.is_alive():
+                        print("[MainLoop] Предупреждение: Предыдущий генератор не завершился!")
 
-                if stop_event.is_set(): break
-                
+                # Сбрасываем ссылки на всякий случай
+                consumer_thread_instance = None
+                generator_thread_instance = None
+
+                if stop_event.is_set(): break # Проверяем еще раз перед accept
+
                 try:
-                    conn_esp32, addr_esp32_conn = server_socket.accept() 
-                    conn_esp32.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1) 
-                    conn_esp32.settimeout(2.0) 
+                    print(f"[*] Сервер слушает порт {ESP32_PORT}...") # Добавим лог
+                    conn_esp32, addr_esp32_conn = server_socket.accept()
+                    conn_esp32.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                    conn_esp32.settimeout(2.0)
                     print(f"[*] ESP32 подключен: {addr_esp32_conn}")
                     RECONNECTIONS_TOTAL.inc()
-                    
-                    # global current_dynamic_threshold # Уже глобальная
-                    # current_dynamic_threshold = MIN_DIRTY_RECT_THRESHOLD # Опциональный сброс при каждом новом подключении
+
                     CURRENT_DYNAMIC_THRESHOLD_VALUE.set(current_dynamic_threshold)
-                    CONSUMER_CALCULATED_FPS.set(0) # Сброс FPS для нового соединения
+                    CONSUMER_CALCULATED_FPS.set(0)
 
                     generator_thread_instance = threading.Thread(
                         target=frame_generator_thread_func,
                         args=(IMAGE_SOURCE_MODE, cpu_monitor_instance, prometheus_monitor_instance, GENERATOR_TARGET_INTERVAL_SEC),
-                        daemon=True 
+                        daemon=True
                     )
                     consumer_thread_instance = threading.Thread(
                         target=frame_consumer_thread_func,
@@ -444,50 +467,57 @@ def main():
                     )
                     generator_thread_instance.start()
                     consumer_thread_instance.start()
+                    print("[MainLoop] Новые потоки генератора и потребителя запущены.")
 
                 except socket.timeout:
-                    continue 
+                    continue # Просто продолжаем цикл ожидания
                 except Exception as e:
                     print(f"[MainLoop] Ошибка при подключении клиента: {e}")
-                    if conn_esp32: 
-                        try: conn_esp32.close()
-                        except: pass
-                    conn_esp32 = None
-                    time.sleep(1) 
-                    continue
-            
-            elif generator_thread_instance and consumer_thread_instance: 
-                if not consumer_thread_instance.is_alive(): 
-                    print("[MainLoop] Поток потребителя завершился.")
-                    if not stop_event.is_set():
-                        print("[MainLoop] Потребитель умер, а stop_event не установлен. Устанавливаю stop_event.")
-                        stop_event.set() # Если потребитель умер, вероятно, что-то не так, останавливаем всё.
-
                     if conn_esp32:
                         try: conn_esp32.close()
                         except: pass
-                    conn_esp32 = None 
-                    if generator_thread_instance.is_alive(): 
-                         generator_thread_instance.join(timeout=1)
-                    if stop_event.is_set(): break 
+                    conn_esp32 = None
+                    time.sleep(1)
+                    continue
+
+            elif generator_thread_instance and consumer_thread_instance: # Если соединение есть и потоки должны работать
+                if not consumer_thread_instance.is_alive():
+                    print("[MainLoop] Поток потребителя завершился (вероятно, разрыв соединения или ошибка).")
+                    # НЕ УСТАНАВЛИВАЕМ stop_event здесь!
+
+                    if conn_esp32:
+                        try:
+                            conn_esp32.close()
+                            print("[MainLoop] Соединение с ESP32 закрыто.")
+                        except Exception as e:
+                            print(f"[MainLoop] Ошибка при закрытии сокета после смерти потребителя: {e}")
+                    conn_esp32 = None # Готовимся к новому подключению
+
+                    # Ссылки на потоки будут сброшены и потоки присоединены
+                    # на следующей итерации в блоке `if conn_esp32 is None:`
+                    print("[MainLoop] Подготовка к ожиданию нового подключения...")
+                    continue # Переходим к следующей итерации главного цикла немедленно
 
                 elif not generator_thread_instance.is_alive():
+                    # Если генератор умер сам по себе - это проблема, останавливаем все.
                     print("[MainLoop] Поток генератора неожиданно завершился!")
-                    if not stop_event.is_set(): stop_event.set() 
-                    break 
-                time.sleep(0.5) 
+                    if not stop_event.is_set(): stop_event.set()
+                    break # Выходим из главного цикла
+
+                # Если оба потока живы и есть соединение, просто ждем
+                time.sleep(0.5)
 
     except KeyboardInterrupt:
         print("\n[*] Завершение работы по KeyboardInterrupt...")
-        if not stop_event.is_set(): stop_event.set() 
+        if not stop_event.is_set(): stop_event.set()
     except Exception as e:
         print(f"[MainLoop] Критическая ошибка: {e}")
         import traceback
         traceback.print_exc()
-        if not stop_event.is_set(): stop_event.set() 
+        if not stop_event.is_set(): stop_event.set()
     finally:
         print("[*] Начало процедуры остановки...")
-        if not stop_event.is_set(): 
+        if not stop_event.is_set():
             stop_event.set()
 
         if cpu_monitor_instance and hasattr(cpu_monitor_instance, 'stop'):
@@ -501,26 +531,26 @@ def main():
             print("[*] Ожидание остановки потока генератора...")
             generator_thread_instance.join(timeout=2)
             if generator_thread_instance.is_alive(): print("[!] Поток генератора не остановился корректно.")
-        
+
         if 'consumer_thread_instance' in locals() and consumer_thread_instance and consumer_thread_instance.is_alive():
             print("[*] Ожидание остановки потока потребителя...")
-            consumer_thread_instance.join(timeout=3) 
+            consumer_thread_instance.join(timeout=3)
             if consumer_thread_instance.is_alive(): print("[!] Поток потребителя не остановился корректно.")
 
-        if 'conn_esp32' in locals() and conn_esp32: 
+        if 'conn_esp32' in locals() and conn_esp32:
             try:
                 print("[*] Закрытие соединения с ESP32...")
                 conn_esp32.close()
             except Exception as e:
                 print(f"Ошибка при закрытии соединения с ESP32: {e}")
-        
-        if 'server_socket' in locals() and server_socket: 
+
+        if 'server_socket' in locals() and server_socket:
             try:
                 print("[*] Закрытие серверного сокета...")
                 server_socket.close()
             except Exception as e:
                 print(f"Ошибка при закрытии серверного сокета: {e}")
-        
+
         if 'prometheus_http_thread' in locals() and prometheus_http_thread and prometheus_http_thread.is_alive():
              print("[*] Prometheus HTTP сервер (daemon) должен завершиться автоматически.")
 
