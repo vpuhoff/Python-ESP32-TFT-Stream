@@ -194,7 +194,7 @@ server_socket.listen(1)
 print(f"[*] Ожидание подключения ESP32 на порту {ESP32_PORT}...")
 
 # --- Выбор источника изображения (раскомментируйте один) ---
-IMAGE_SOURCE_MODE = "PROMETHEUS_MONITOR" # "SCREEN_CAPTURE", "BIOS", "CPU_MONITOR", "PROMETHEUS_MONITOR"
+IMAGE_SOURCE_MODE = "SCREEN_CAPTURE" # "SCREEN_CAPTURE", "BIOS", "CPU_MONITOR", "PROMETHEUS_MONITOR"
 # ----------------------------------------------------------
 
 try:
@@ -221,7 +221,7 @@ try:
             if IMAGE_SOURCE_MODE == "SCREEN_CAPTURE":
                 try:
                     sct_img_bgra = sct.grab(CAPTURE_REGION)
-                    curr_image_full = Image.frombytes('RGB', (sct_img_bgra.width, sct_img_bgra.height), sct_img_bgra.rgb, 'raw', 'BGR') # BGR to RGB
+                    curr_image_full = Image.frombytes('RGB', (sct_img_bgra.width, sct_img_bgra.height), sct_img_bgra.rgb, 'raw', 'RGB') # BGR to RGB
                 except mss.ScreenShotError as e:
                     print(f"Ошибка захвата экрана: {e}")
                     time.sleep(1)
