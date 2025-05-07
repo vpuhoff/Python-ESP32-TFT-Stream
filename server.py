@@ -9,6 +9,32 @@ from bios_drawer import draw_bios_on_image, DEFAULT_BIOS_RESOLUTION
 from cpu_monitor_generator import CpuMonitorGenerator
 from prometheus_monitor_generator import COLORS, RESOLUTION, PrometheusMonitorGenerator
 
+# --- Prometheus Exporter ---
+from prometheus_client import start_http_server, Histogram, Counter
+import threading # Для запуска HTTP сервера Prometheus в отдельном потоке
+
+# --- Настройки Prometheus Exporter ---
+PROMETHEUS_EXPORTER_PORT = 8000 # Порт, на котором будут доступны метрики
+
+# --- Определяем метрики ---
+# Используем Histogram для измерения распределения времени выполнения
+FRAME_PROCESSING_TIME = Histogram('esp32_frame_processing_seconds', 'Время обработки одного кадра',
+                                  ['stage'])
+
+packet_size_buckets = (
+    12,  # Только заголовок (маловероятно, но для полноты)
+    256, 512, 1024, 2048, 4096, 
+    8192, 8192 + 12, # Размер максимального чанка и с заголовком
+    10000,
+    16384, 25000, 32768, 50000, float('inf') # Если вдруг будут пакеты больше
+)
+
+PACKET_SIZE_BYTES = Histogram('esp32_packet_size_bytes', 'Размер отправленных пакетов в байтах', buckets=packet_size_buckets)
+CHUNKS_PER_FRAME = Histogram('esp32_chunks_per_frame', 'Количество чанков на кадр')
+CONNECTION_ERRORS = Counter('esp32_connection_errors_total', 'Количество ошибок соединения при отправке')
+RECONNECTIONS_TOTAL = Counter('esp32_reconnections_total', 'Общее количество переподключений ESP32')
+
+
 # --- Настройки ---
 ESP32_PORT = 8888
 TARGET_WIDTH = 320 # Ширина дисплея ESP32
@@ -34,42 +60,46 @@ def rgb_to_rgb565(r, g, b):
 def image_to_rgb565_bytes(img: Image.Image):
     """Конвертирует Pillow Image (RGB) в байты RGB565."""
     # --- APPLY GAMMA CORRECTION ---
+    gamma_start_time = time.monotonic()
     try:
          # print(f"Applying gamma correction...") # Add print
-         img = apply_gamma_and_white_balance(img, gamma=2.6, wb_scale=(0.95, 1.0, 0.75)) # Adjust gamma value (e.g., 1.8, 2.0, 2.2, 2.4) experimentally
+         img = apply_gamma_and_white_balance(img, gamma=GAMMA, wb_scale=WB_SCALE) # Используем глобальные настройки
          # print("Gamma applied.")
     except ImportError:
          print("Numpy not found, skipping gamma correction.")
     except Exception as e:
          print(f"Error during gamma correction: {e}")
+    FRAME_PROCESSING_TIME.labels(stage='color_correction').observe(time.monotonic() - gamma_start_time)
     # -----------------------------
+
+    conversion_start_time = time.monotonic()
     pixels = img.load()
     width, height = img.size
     byte_data = bytearray(width * height * 2) # 2 байта на пиксель
     idx = 0
-    for y in range(height):
-        for x in range(width):
-            r, g, b = pixels[x, y]
+    for y_coord in range(height): # Изменено имя переменной, чтобы не конфликтовать с глобальной y
+        for x_coord in range(width): # Изменено имя переменной
+            r, g, b = pixels[x_coord, y_coord]
             rgb565 = rgb_to_rgb565(r, g, b)
             # Упаковываем как 16-битное беззнаковое целое в big-endian (network order)
             struct.pack_into('!H', byte_data, idx, rgb565)
             idx += 2
+    FRAME_PROCESSING_TIME.labels(stage='rgb565_conversion').observe(time.monotonic() - conversion_start_time)
     return bytes(byte_data)
 
 def find_dirty_rects(img_prev: Image.Image | None, img_curr: Image.Image, threshold=10):
     """
     Находит измененные прямоугольники.
     Простой алгоритм: находит ОДИН большой прямоугольник, охватывающий все изменения.
-    Более сложный алгоритм мог бы находить несколько меньших прямоугольников.
-    threshold: порог разницы в цвете, чтобы считать пиксель измененным.
     """
+    diff_start_time = time.monotonic()
     if img_prev is None:
-        # Первый кадр - отправляем все
+        FRAME_PROCESSING_TIME.labels(stage='diff_calculation').observe(time.monotonic() - diff_start_time)
         yield (0, 0, img_curr.width, img_curr.height)
         return
 
     if img_prev.size != img_curr.size:
-        # Размер изменился (не должно происходить при масштабировании) - отправляем все
+        FRAME_PROCESSING_TIME.labels(stage='diff_calculation').observe(time.monotonic() - diff_start_time)
         yield (0, 0, img_curr.width, img_curr.height)
         return
 
@@ -81,189 +111,243 @@ def find_dirty_rects(img_prev: Image.Image | None, img_curr: Image.Image, thresh
     max_x, max_y = -1, -1
     changed = False
 
-    # Находим границы изменившейся области
-    for y in range(height):
-        for x in range(width):
-            r1, g1, b1 = pixels_prev[x, y]
-            r2, g2, b2 = pixels_curr[x, y]
-            # Простое сравнение суммы абсолютных разниц
+    for y_coord in range(height): # Изменено имя переменной
+        for x_coord in range(width): # Изменено имя переменной
+            r1, g1, b1 = pixels_prev[x_coord, y_coord]
+            r2, g2, b2 = pixels_curr[x_coord, y_coord]
             diff = abs(r1 - r2) + abs(g1 - g2) + abs(b1 - b2)
             if diff > threshold:
                 changed = True
-                if x < min_x: min_x = x
-                if y < min_y: min_y = y
-                if x > max_x: max_x = x
-                if y > max_y: max_y = y
+                if x_coord < min_x: min_x = x_coord
+                if y_coord < min_y: min_y = y_coord
+                if x_coord > max_x: max_x = x_coord
+                if y_coord > max_y: max_y = y_coord
 
     if changed:
-        # Возвращаем один прямоугольник (добавляем 1 к max_x/max_y для получения ширины/высоты)
-        # Убедимся, что ширина/высота > 0
         rect_w = max_x - min_x + 1
         rect_h = max_y - min_y + 1
         if rect_w > 0 and rect_h > 0:
-             # **Улучшение:** Можно было бы реализовать алгоритм, возвращающий МНОГО
-             #               маленьких прямоугольников, но начнем с одного большого.
+            FRAME_PROCESSING_TIME.labels(stage='diff_calculation').observe(time.monotonic() - diff_start_time)
             yield (min_x, min_y, rect_w, rect_h)
+    else: # Если изменений нет, все равно фиксируем время
+        FRAME_PROCESSING_TIME.labels(stage='diff_calculation').observe(time.monotonic() - diff_start_time)
+
 
 def pack_update_packet(x, y, w, h, data: bytes):
     """
     Упаковывает данные обновления.
     Формат: X(2B), Y(2B), W(2B), H(2B), DataLen(4B), Data(DataLen B)
-    Используем Network Order (Big-Endian).
     """
+    pack_start_time = time.monotonic()
     data_len = len(data)
-    # '!HHHH I' - Big-endian, 4x unsigned short, 1x unsigned int
     header = struct.pack('!HHHH I', x, y, w, h, data_len)
-    return header + data
+    packet = header + data
+    FRAME_PROCESSING_TIME.labels(stage='packet_packing').observe(time.monotonic() - pack_start_time)
+    PACKET_SIZE_BYTES.observe(len(packet))
+    return packet
 
-def apply_gamma_and_white_balance(img: Image.Image, gamma=2.2, wb_scale=(1.0, 1.0, 0.95)): # Reduce Blue slightly
+def apply_gamma_and_white_balance(img: Image.Image, gamma=2.2, wb_scale=(1.0, 1.0, 0.95)):
     if img.mode != 'RGB':
         img = img.convert('RGB')
     img_array = np.array(img, dtype=np.float32) / 255.0
-    # Apply gamma
     img_corrected = np.power(img_array, gamma)
-    # Apply white balance scaling
-    # Ensure wb_scale is broadcastable (1, 1, 3)
     scale = np.array(wb_scale).reshape(1, 1, 3)
     img_balanced = img_corrected * scale
-    # Combine and convert back
     img_final = np.clip(img_balanced * 255.0, 0, 255).astype(np.uint8)
     return Image.fromarray(img_final, 'RGB')
+
 # --- Основная логика ---
 
 prev_image = None
 conn = None
 addr = None
 
+# --- Запуск Prometheus HTTP сервера в отдельном потоке ---
+def start_prometheus_server():
+    try:
+        start_http_server(PROMETHEUS_EXPORTER_PORT)
+        print(f"[*] Prometheus exporter запущен на порту {PROMETHEUS_EXPORTER_PORT}")
+    except Exception as e:
+        print(f"[!] Не удалось запустить Prometheus exporter: {e}")
+
+prometheus_thread = threading.Thread(target=start_prometheus_server, daemon=True)
+prometheus_thread.start()
+# ---------------------------------------------------------
+
+
 # Настройка TCP сервера
 server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1) # Позволяет переиспользовать адрес
-server_socket.bind(('', ESP32_PORT)) # Слушаем на всех интерфейсах
+server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+server_socket.bind(('', ESP32_PORT))
 server_socket.listen(1)
 print(f"[*] Ожидание подключения ESP32 на порту {ESP32_PORT}...")
+
+# --- Выбор источника изображения (раскомментируйте один) ---
+IMAGE_SOURCE_MODE = "PROMETHEUS_MONITOR" # "SCREEN_CAPTURE", "BIOS", "CPU_MONITOR", "PROMETHEUS_MONITOR"
+# ----------------------------------------------------------
 
 try:
     conn, addr = server_socket.accept()
     print(f"[*] ESP32 подключен: {addr}")
+    RECONNECTIONS_TOTAL.inc()
 
-    # with CpuMonitorGenerator() as cpu_monitor:
-    with PrometheusMonitorGenerator() as monitor:
-        with mss.mss() as sct: # Инициализация захвата экрана
-            while True:
-                start_time = time.time()
+    # Инициализация генераторов один раз
+    cpu_monitor_instance = None
+    prometheus_monitor_instance = None
 
-                # 1a. Захват экрана
-                # try:
-                #     sct_img_bgra = sct.grab(CAPTURE_REGION) # Захват в формате BGRA
-                #     # Конвертируем в Pillow Image (RGB)
-                #     curr_image_full = Image.frombytes('RGB', (sct_img_bgra.width, sct_img_bgra.height), sct_img_bgra.rgb)
-                # except mss.ScreenShotError as e:
-                #     print(f"Ошибка захвата экрана: {e}")
-                #     time.sleep(1)
-                #     continue
-                # 1b. Рисуем BIOS на пустом изображении
-                # width, height = DEFAULT_BIOS_RESOLUTION
-                # my_image = Image.new('RGB', (width, height))
-                # curr_image_full = draw_bios_on_image(my_image)
-                # 1c. Рисуем CPU монитор на пустом изображении
-                # curr_image_full = Image.new('RGB', cpu_monitor.resolution)
-                # cpu_monitor.draw_frame(curr_image_full)
+    if IMAGE_SOURCE_MODE == "CPU_MONITOR":
+        cpu_monitor_instance = CpuMonitorGenerator()
+    elif IMAGE_SOURCE_MODE == "PROMETHEUS_MONITOR":
+        prometheus_monitor_instance = PrometheusMonitorGenerator()
+
+    with mss.mss() as sct:
+        while True:
+            frame_loop_start_time = time.monotonic() # Начало полного цикла обработки кадра
+            total_chunks_current_frame = 0
+
+            # 1. Получение/Генерация изображения
+            capture_gen_start_time = time.monotonic()
+            if IMAGE_SOURCE_MODE == "SCREEN_CAPTURE":
+                try:
+                    sct_img_bgra = sct.grab(CAPTURE_REGION)
+                    curr_image_full = Image.frombytes('RGB', (sct_img_bgra.width, sct_img_bgra.height), sct_img_bgra.rgb, 'raw', 'BGR') # BGR to RGB
+                except mss.ScreenShotError as e:
+                    print(f"Ошибка захвата экрана: {e}")
+                    time.sleep(1)
+                    continue
+                FRAME_PROCESSING_TIME.labels(stage='capture_screen').observe(time.monotonic() - capture_gen_start_time)
+            elif IMAGE_SOURCE_MODE == "BIOS":
+                my_image = Image.new('RGB', DEFAULT_BIOS_RESOLUTION)
+                curr_image_full = draw_bios_on_image(my_image)
+                FRAME_PROCESSING_TIME.labels(stage='generate_bios').observe(time.monotonic() - capture_gen_start_time)
+            elif IMAGE_SOURCE_MODE == "CPU_MONITOR" and cpu_monitor_instance:
+                curr_image_full = Image.new('RGB', cpu_monitor_instance.resolution)
+                cpu_monitor_instance.draw_frame(curr_image_full)
+                FRAME_PROCESSING_TIME.labels(stage='generate_cpu_monitor').observe(time.monotonic() - capture_gen_start_time)
+            elif IMAGE_SOURCE_MODE == "PROMETHEUS_MONITOR" and prometheus_monitor_instance:
                 curr_image_full = Image.new('RGB', RESOLUTION, color=COLORS["background"])
-                monitor.generate_image_frame(curr_image_full)
+                prometheus_monitor_instance.generate_image_frame(curr_image_full) # Используем глобальные RESOLUTION и COLORS
+                FRAME_PROCESSING_TIME.labels(stage='generate_prometheus_monitor').observe(time.monotonic() - capture_gen_start_time)
+            else:
+                print(f"Неизвестный или неинициализированный IMAGE_SOURCE_MODE: {IMAGE_SOURCE_MODE}")
+                time.sleep(1)
+                continue
 
-                # 2. Масштабирование до целевого разрешения
-                curr_image_resized = curr_image_full.resize((TARGET_WIDTH, TARGET_HEIGHT), Image.Resampling.LANCZOS) # Или Image.BILINEAR для сглаживания
 
-                # 3. Поиск измененных областей
-                dirty_rects = list(find_dirty_rects(prev_image, curr_image_resized))
+            # 2. Масштабирование до целевого разрешения
+            resize_start_time = time.monotonic()
+            curr_image_resized = curr_image_full.resize((TARGET_WIDTH, TARGET_HEIGHT), Image.Resampling.LANCZOS)
+            FRAME_PROCESSING_TIME.labels(stage='resize').observe(time.monotonic() - resize_start_time)
 
-                # 4. Отправка изменений
-                if dirty_rects:
-                    # print(f"Кадр {time.time():.2f}: Найдено {len(dirty_rects)} измененных областей.")
-                    for (x, y, w, h) in dirty_rects:
-                        # print(f"  Обработка Rect({x},{y}, {w}x{h})")
+            # 3. Поиск измененных областей (color_correction и rgb565_conversion будут вызываться внутри image_to_rgb565_bytes)
+            dirty_rects = list(find_dirty_rects(prev_image, curr_image_resized))
 
-                        # --- НАЧАЛО ИЗМЕНЕНИЙ: Логика разбиения больших областей ---
-                        full_rect_data_size = w * h * 2
-                        if full_rect_data_size > MAX_CHUNK_DATA_SIZE:
-                            # print(f"    Область {w}x{h} ({full_rect_data_size} Б) слишком большая, разбиваем...")
-                            # Разбиваем на горизонтальные полосы (простой вариант)
-                            # Определяем высоту одной полосы так, чтобы она помещалась в MAX_CHUNK_DATA_SIZE
-                            bytes_per_row = w * 2
-                            if bytes_per_row > MAX_CHUNK_DATA_SIZE:
-                                print(f"      ОШИБКА: Ширина {w} ({bytes_per_row} байт/строка) уже больше MAX_CHUNK_DATA_SIZE ({MAX_CHUNK_DATA_SIZE})! Увеличьте MAX_CHUNK_DATA_SIZE или уменьшите ширину захвата.")
-                                # Пропустить эту область или обработать иначе (например, разбить по ширине)
-                                continue # Пока пропускаем
+            # 4. Отправка изменений
+            if dirty_rects:
+                total_chunks_current_frame = 0
+                for (x, y, w, h) in dirty_rects:
+                    chunking_crop_start_time = time.monotonic()
+                    full_rect_data_size = w * h * 2
+                    if full_rect_data_size > MAX_CHUNK_DATA_SIZE:
+                        bytes_per_row = w * 2
+                        if bytes_per_row == 0: # Избегаем деления на ноль, если w=0
+                             print(f"      ПРЕДУПРЕЖДЕНИЕ: Ширина области {w} равна нулю. Пропуск чанка.")
+                             continue
+                        if bytes_per_row > MAX_CHUNK_DATA_SIZE : # Это условие должно проверяться до bytes_per_row == 0
+                            print(f"      ОШИБКА: Ширина {w} ({bytes_per_row} байт/строка) уже больше MAX_CHUNK_DATA_SIZE ({MAX_CHUNK_DATA_SIZE})! Увеличьте MAX_CHUNK_DATA_SIZE или уменьшите ширину захвата.")
+                            continue
 
-                            chunk_h = MAX_CHUNK_DATA_SIZE // bytes_per_row # Макс. строк в одном чанке
-                            if chunk_h == 0: chunk_h = 1 # Минимум 1 строка
+                        chunk_h = MAX_CHUNK_DATA_SIZE // bytes_per_row
+                        if chunk_h == 0: chunk_h = 1
 
-                            for current_y_offset in range(0, h, chunk_h):
-                                actual_chunk_h = min(chunk_h, h - current_y_offset) # Высота текущего чанка
-                                chunk_x = x
-                                chunk_y = y + current_y_offset
-                                chunk_w = w
+                        for current_y_offset in range(0, h, chunk_h):
+                            actual_chunk_h = min(chunk_h, h - current_y_offset)
+                            chunk_x = x
+                            chunk_y = y + current_y_offset
+                            chunk_w = w
 
-                                # Вырезаем чанк из ТЕКУЩЕГО кадра
-                                chunk_img = curr_image_resized.crop((chunk_x, chunk_y, chunk_x + chunk_w, chunk_y + actual_chunk_h))
-                                # Конвертируем чанк в RGB565 байты
-                                chunk_data_rgb565 = image_to_rgb565_bytes(chunk_img)
-                                # Упаковываем пакет для чанка
-                                packet = pack_update_packet(chunk_x, chunk_y, chunk_w, actual_chunk_h, chunk_data_rgb565)
-                                # Отправляем пакет чанка
-                                try:
-                                    # print(f"      Отправка чанка: Rect({chunk_x},{chunk_y}, {chunk_w}x{actual_chunk_h}), Данные: {len(chunk_data_rgb565)} Б")
-                                    conn.sendall(packet)
-                                except socket.error as e:
-                                    print(f"Ошибка отправки чанка: {e}")
-                                    conn = None
-                                    break # Прервать отправку чанков этой области
-                            # --- Конец цикла по чанкам ---
-                            if conn is None: break # Прервать обработку dirty_rects если была ошибка сети
+                            chunk_img = curr_image_resized.crop((chunk_x, chunk_y, chunk_x + chunk_w, chunk_y + actual_chunk_h))
+                            FRAME_PROCESSING_TIME.labels(stage='chunking_and_crop').observe(time.monotonic() - chunking_crop_start_time) # Время на один чанк
 
-                        else:
-                            # Область достаточно мала, отправляем как есть
-                            #print(f"    Область {w}x{h} ({full_rect_data_size} Б) ОК.")
-                            # Вырезаем измененную область из ТЕКУЩЕГО кадра
-                            region_img = curr_image_resized.crop((x, y, x + w, y + h))
-                            # Конвертируем область в RGB565 байты
-                            region_data_rgb565 = image_to_rgb565_bytes(region_img)
-                            # Упаковываем пакет
-                            packet = pack_update_packet(x, y, w, h, region_data_rgb565)
-                            # Отправляем пакет
+                            # Конвертация и упаковка измеряются внутри функций image_to_rgb565_bytes и pack_update_packet
+                            chunk_data_rgb565 = image_to_rgb565_bytes(chunk_img)
+                            packet = pack_update_packet(chunk_x, chunk_y, chunk_w, actual_chunk_h, chunk_data_rgb565)
+
+                            send_start_time = time.monotonic()
                             try:
-                                # print(f"    Отправка: Rect({x},{y}, {w}x{h}), Размер данных: {len(region_data_rgb565)} байт")
                                 conn.sendall(packet)
+                                FRAME_PROCESSING_TIME.labels(stage='send_packet').observe(time.monotonic() - send_start_time)
+                                total_chunks_current_frame += 1
                             except socket.error as e:
-                                print(f"Ошибка отправки: {e}")
+                                print(f"Ошибка отправки чанка: {e}")
+                                CONNECTION_ERRORS.inc()
                                 conn = None
-                                break # Выход из цикла for dirty_rects
+                                break
+                            chunking_crop_start_time = time.monotonic() # Сброс для следующего чанка
+                        # --- Конец цикла по чанкам ---
+                        if conn is None: break
 
-                # else:
-                #     print(f"Кадр {time.time():.2f}: Изменений нет.")
+                    else: # Область достаточно мала
+                        FRAME_PROCESSING_TIME.labels(stage='chunking_and_crop').observe(time.monotonic() - chunking_crop_start_time) # Время на одну "не-чанкованную" область
+                        region_img = curr_image_resized.crop((x, y, x + w, y + h))
+                        region_data_rgb565 = image_to_rgb565_bytes(region_img)
+                        packet = pack_update_packet(x, y, w, h, region_data_rgb565)
 
-                # Если соединение было разорвано во время отправки
-                if conn is None:
-                    print("Соединение потеряно, ожидание нового подключения...")
-                    prev_image = None # Сбросить предыдущий кадр для полной отправки при переподключении
-                    conn, addr = server_socket.accept() # Ждем нового подключения
-                    print(f"[*] ESP32 переподключен: {addr}")
-                    continue # Начать цикл заново с новым соединением
+                        send_start_time = time.monotonic()
+                        try:
+                            conn.sendall(packet)
+                            FRAME_PROCESSING_TIME.labels(stage='send_packet').observe(time.monotonic() - send_start_time)
+                            total_chunks_current_frame += 1
+                        except socket.error as e:
+                            print(f"Ошибка отправки: {e}")
+                            CONNECTION_ERRORS.inc()
+                            conn = None
+                            break
+                if total_chunks_current_frame > 0 : # Записываем только если были чанки
+                    CHUNKS_PER_FRAME.observe(total_chunks_current_frame)
 
-                # Сохраняем текущий кадр как предыдущий для следующей итерации
-                prev_image = curr_image_resized # Важно: сохраняем именно масштабированный кадр
 
-                # Пауза для контроля частоты кадров
-                elapsed_time = time.time() - start_time
-                sleep_time = UPDATE_INTERVAL_SEC - elapsed_time
-                if sleep_time > 0:
-                    time.sleep(sleep_time)
+            if conn is None:
+                print("Соединение потеряно, ожидание нового подключения...")
+                prev_image = None
+                # Закрываем старое соединение перед новым accept, если оно еще не None
+                # (хотя в данном потоке оно уже должно быть None)
+                # if conn:
+                # try:
+                # conn.close()
+                # except Exception:
+                # pass # Игнорируем ошибки при закрытии уже разорванного сокета
+                conn, addr = server_socket.accept()
+                print(f"[*] ESP32 переподключен: {addr}")
+                RECONNECTIONS_TOTAL.inc()
+                continue
+
+            prev_image = curr_image_resized
+
+            # Общее время на обработку и отправку одного кадра
+            FRAME_PROCESSING_TIME.labels(stage='full_frame_loop').observe(time.monotonic() - frame_loop_start_time)
+
+            elapsed_time = time.monotonic() - frame_loop_start_time # Используем monotonic для измерения длительности
+            sleep_time = UPDATE_INTERVAL_SEC - elapsed_time
+            if sleep_time > 0:
+                time.sleep(sleep_time)
 
 except KeyboardInterrupt:
     print("\n[*] Завершение работы...")
 finally:
+    if cpu_monitor_instance:
+        cpu_monitor_instance.stop()
+    if prometheus_monitor_instance:
+        prometheus_monitor_instance.stop()
     if conn:
-        conn.close()
+        try:
+            conn.close()
+        except Exception as e:
+            print(f"Ошибка при закрытии соединения с ESP32: {e}")
         print("[*] Соединение с ESP32 закрыто.")
-    server_socket.close()
+    try:
+        server_socket.close()
+    except Exception as e:
+        print(f"Ошибка при закрытии серверного сокета: {e}")
     print("[*] Серверный сокет закрыт.")
+    print("[*] Prometheus exporter поток также должен завершиться (daemon).")
