@@ -3,152 +3,135 @@ import time
 import mss # Для скриншотов
 from PIL import Image # Для обработки изображений
 import struct # Для упаковки данных в байты
-import io # Для работы с байтами как с файлом
 import numpy as np # Для работы с массивами
+from collections import deque # Для истории FPS и очереди
+
+# Импорт ваших модулей
 from bios_drawer import draw_bios_on_image, DEFAULT_BIOS_RESOLUTION
 from cpu_monitor_generator import CpuMonitorGenerator
-from prometheus_monitor_generator import COLORS, RESOLUTION, PrometheusMonitorGenerator
+from prometheus_monitor_generator import PrometheusMonitorGenerator
 
-# --- Prometheus Exporter ---
-from prometheus_client import start_http_server, Histogram, Counter
-import threading # Для запуска HTTP сервера Prometheus в отдельном потоке
+# Prometheus Exporter
+from prometheus_client import start_http_server, Histogram, Counter, Gauge # <--- Убедимся, что Gauge импортирован
+import threading 
+import queue 
 
 # --- Настройки Prometheus Exporter ---
-PROMETHEUS_EXPORTER_PORT = 8000 # Порт, на котором будут доступны метрики
+PROMETHEUS_EXPORTER_PORT = 8000 
 
 # --- Определяем метрики ---
-# Используем Histogram для измерения распределения времени выполнения
 FRAME_PROCESSING_TIME = Histogram('esp32_frame_processing_seconds', 'Время обработки одного кадра',
                                   ['stage'])
-
 packet_size_buckets = (
-    12,  # Только заголовок (маловероятно, но для полноты)
-    256, 512, 1024, 2048, 4096, 
-    8192, 8192 + 12, # Размер максимального чанка и с заголовком
-    10000,
-    16384, 25000, 32768, 50000, float('inf') # Если вдруг будут пакеты больше
+    12, 256, 512, 1024, 2048, 4096,
+    8192, 8192 + 12, 10000,
+    16384, 25000, 32768, 50000, float('inf')
 )
-
 PACKET_SIZE_BYTES = Histogram('esp32_packet_size_bytes', 'Размер отправленных пакетов в байтах', buckets=packet_size_buckets)
 CHUNKS_PER_FRAME = Histogram('esp32_chunks_per_frame', 'Количество чанков на кадр')
 CONNECTION_ERRORS = Counter('esp32_connection_errors_total', 'Количество ошибок соединения при отправке')
 RECONNECTIONS_TOTAL = Counter('esp32_reconnections_total', 'Общее количество переподключений ESP32')
+FRAMES_GENERATED = Counter('esp32_frames_generated_total', 'Количество сгенерированных кадров (потоком генератора)')
+FRAMES_PROCESSED = Counter('esp32_frames_processed_total', 'Количество обработанных и отправленных кадров (потоком потребителя)')
+QUEUE_SIZE_FRAMES = Histogram('esp32_frames_queue_size', 'Количество кадров в очереди обработки')
+DIRTY_RECTS_SEND_DURATION = Histogram('esp32_dirty_rects_send_duration_seconds', 
+                                      'Общее время отправки всех dirty_rects для одного кадра')
+CURRENT_DYNAMIC_THRESHOLD_VALUE = Gauge('esp32_current_dynamic_threshold', 
+                                        'Текущее значение динамического порога для dirty_rects')
+# --- НОВАЯ МЕТРИКА GAUGE ДЛЯ FPS ---
+CONSUMER_CALCULATED_FPS = Gauge('esp32_consumer_calculated_fps',
+                                'Расчетный FPS на основе времени обработки кадров в потребителе')
+# ---------------------------------
 
-
-# --- Настройки ---
+# --- Общие настройки сервера ---
 ESP32_PORT = 8888
-TARGET_WIDTH = 320 # Ширина дисплея ESP32
-TARGET_HEIGHT = 240 # Высота дисплея ESP32
-UPDATE_INTERVAL_SEC = 0.1 # Пауза между обновлениями (10 кадров/сек)
+TARGET_WIDTH = 320
+TARGET_HEIGHT = 240
+GENERATOR_TARGET_INTERVAL_SEC = 0.05 
 
-# Область захвата на ПК (замените на нужные координаты и размеры)
-# Монитор 1, отступ 100,100, размер 800x600
+# Настройки захвата экрана и обработки изображения
 CAPTURE_REGION = {'top': 170, 'left': 60, 'width': 320, 'height': 240, 'mon': 1}
 MAX_CHUNK_DATA_SIZE = 8192
-GAMMA=2.8 # Гамма-коррекция (можно настроить)
-WB_SCALE=(0.85, 0.95, 0.75) # Баланс белого (можно настроить)
+GAMMA = 2.8
+WB_SCALE = (0.85, 0.95, 0.75)
 
-# Или можно попробовать захватить весь экран:
-# CAPTURE_REGION = mss.mss().monitors[1] # Основной монитор
+# --- Настройки для динамического Threshold ---
+TARGET_FPS = 10.0
+MIN_DIRTY_RECT_THRESHOLD = 20
+MAX_DIRTY_RECT_THRESHOLD = 80
+THRESHOLD_ADJUSTMENT_STEP_UP = 10   
+THRESHOLD_ADJUSTMENT_STEP_DOWN = 5  
+FPS_HISTORY_SIZE = 10             
+FPS_HYSTERESIS_FACTOR = 0.1       
 
-# --- Вспомогательные функции ---
+current_dynamic_threshold = MIN_DIRTY_RECT_THRESHOLD 
+frame_processing_times_history = deque(maxlen=FPS_HISTORY_SIZE) 
 
+# Настройки для многопоточности
+FRAMES_QUEUE_MAX_SIZE = 5  
+GENERATOR_LOW_WATER_MARK = 2 
+
+# Выбор источника изображения 
+IMAGE_SOURCE_MODE = "SCREEN_CAPTURE" 
+
+frames_queue = queue.Queue(maxsize=FRAMES_QUEUE_MAX_SIZE)
+stop_event = threading.Event() 
+
+# --- Вспомогательные функции (без изменений) ---
 def rgb_to_rgb565(r, g, b):
-    """Конвертирует 8-битный RGB в 16-битный RGB565."""
     return ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3)
 
 def image_to_rgb565_bytes(img: Image.Image):
-    """Конвертирует Pillow Image (RGB) в байты RGB565."""
-    # --- APPLY GAMMA CORRECTION ---
     gamma_start_time = time.monotonic()
     try:
-         # print(f"Applying gamma correction...") # Add print
-         img = apply_gamma_and_white_balance(img, gamma=GAMMA, wb_scale=WB_SCALE) # Используем глобальные настройки
-         # print("Gamma applied.")
+        img = apply_gamma_and_white_balance(img, gamma=GAMMA, wb_scale=WB_SCALE)
     except ImportError:
-         print("Numpy not found, skipping gamma correction.")
+        print("Numpy not found, skipping gamma correction.")
     except Exception as e:
-         print(f"Error during gamma correction: {e}")
+        print(f"Error during gamma correction: {e}")
     FRAME_PROCESSING_TIME.labels(stage='color_correction').observe(time.monotonic() - gamma_start_time)
-    # -----------------------------
 
     conversion_start_time = time.monotonic()
     pixels = img.load()
     width, height = img.size
-    byte_data = bytearray(width * height * 2) # 2 байта на пиксель
+    byte_data = bytearray(width * height * 2)
     idx = 0
-    for y_coord in range(height): # Изменено имя переменной, чтобы не конфликтовать с глобальной y
-        for x_coord in range(width): # Изменено имя переменной
+    for y_coord in range(height):
+        for x_coord in range(width):
             r, g, b = pixels[x_coord, y_coord]
-            rgb565 = rgb_to_rgb565(r, g, b)
-            # Упаковываем как 16-битное беззнаковое целое в big-endian (network order)
-            struct.pack_into('!H', byte_data, idx, rgb565)
+            rgb565_val = rgb_to_rgb565(r, g, b)
+            struct.pack_into('!H', byte_data, idx, rgb565_val)
             idx += 2
     FRAME_PROCESSING_TIME.labels(stage='rgb565_conversion').observe(time.monotonic() - conversion_start_time)
     return bytes(byte_data)
 
 def find_dirty_rects(img_prev: Image.Image | None, img_curr: Image.Image, threshold=10):
-    """
-    Находит измененные прямоугольники с использованием NumPy для ускорения.
-    Возвращает один большой прямоугольник, охватывающий все изменения.
-    """
     diff_start_time = time.monotonic()
-
     if img_prev is None or img_prev.size != img_curr.size:
         FRAME_PROCESSING_TIME.labels(stage='diff_calculation').observe(time.monotonic() - diff_start_time)
         yield (0, 0, img_curr.width, img_curr.height)
         return
 
-    # Преобразуем изображения Pillow в массивы NumPy
-    # Убедимся, что изображения в режиме RGB для корректного сравнения каналов
-    if img_prev.mode != 'RGB':
-        img_prev_rgb = img_prev.convert('RGB')
-    else:
-        img_prev_rgb = img_prev
-
-    if img_curr.mode != 'RGB':
-        img_curr_rgb = img_curr.convert('RGB')
-    else:
-        img_curr_rgb = img_curr
+    img_prev_rgb = img_prev.convert('RGB') if img_prev.mode != 'RGB' else img_prev
+    img_curr_rgb = img_curr.convert('RGB') if img_curr.mode != 'RGB' else img_curr
         
-    arr_prev = np.array(img_prev_rgb, dtype=np.int16) # Используем int16 чтобы избежать переполнения при вычитании
+    arr_prev = np.array(img_prev_rgb, dtype=np.int16)
     arr_curr = np.array(img_curr_rgb, dtype=np.int16)
-
-    # Вычисляем абсолютную разницу по каждому каналу, затем суммируем разницы
-    # Это эквивалентно abs(r1-r2) + abs(g1-g2) + abs(b1-b2)
     abs_diff_arr = np.sum(np.abs(arr_curr - arr_prev), axis=2)
-
-    # Находим пиксели, где суммарная разница превышает порог
     changed_pixels_mask = abs_diff_arr > threshold
-
-    # Находим координаты изменившихся пикселей
-    # np.where возвращает кортеж массивов (один для каждой размерности)
     changed_y_coords, changed_x_coords = np.where(changed_pixels_mask)
 
-    if changed_y_coords.size > 0: # Если есть хотя бы один измененный пиксель
-        min_x = np.min(changed_x_coords)
-        max_x = np.max(changed_x_coords)
-        min_y = np.min(changed_y_coords)
-        max_y = np.max(changed_y_coords)
-
-        rect_w = int(max_x - min_x + 1) # Преобразуем в int, т.к. numpy может вернуть свои типы
-        rect_h = int(max_y - min_y + 1)
-
+    if changed_y_coords.size > 0:
+        min_x, max_x = int(np.min(changed_x_coords)), int(np.max(changed_x_coords))
+        min_y, max_y = int(np.min(changed_y_coords)), int(np.max(changed_y_coords))
+        rect_w, rect_h = (max_x - min_x + 1), (max_y - min_y + 1)
         FRAME_PROCESSING_TIME.labels(stage='diff_calculation').observe(time.monotonic() - diff_start_time)
-        yield (int(min_x), int(min_y), rect_w, rect_h)
+        yield (min_x, min_y, rect_w, rect_h)
     else:
-        # Изменений не найдено
         FRAME_PROCESSING_TIME.labels(stage='diff_calculation').observe(time.monotonic() - diff_start_time)
-        # Ничего не возвращаем, или можно вернуть специальный флаг/пустой кортеж,
-        # в зависимости от того, как вызывающий код это обрабатывает.
-        # Текущая логика ожидает, что если ничего не yield, то dirty_rects будет пустым.
         return
 
 def pack_update_packet(x, y, w, h, data: bytes):
-    """
-    Упаковывает данные обновления.
-    Формат: X(2B), Y(2B), W(2B), H(2B), DataLen(4B), Data(DataLen B)
-    """
     pack_start_time = time.monotonic()
     data_len = len(data)
     header = struct.pack('!HHHH I', x, y, w, h, data_len)
@@ -167,13 +150,7 @@ def apply_gamma_and_white_balance(img: Image.Image, gamma=2.2, wb_scale=(1.0, 1.
     img_final = np.clip(img_balanced * 255.0, 0, 255).astype(np.uint8)
     return Image.fromarray(img_final, 'RGB')
 
-# --- Основная логика ---
-
-prev_image = None
-conn = None
-addr = None
-
-# --- Запуск Prometheus HTTP сервера в отдельном потоке ---
+# --- Запуск Prometheus HTTP сервера ---
 def start_prometheus_server():
     try:
         start_http_server(PROMETHEUS_EXPORTER_PORT)
@@ -181,184 +158,373 @@ def start_prometheus_server():
     except Exception as e:
         print(f"[!] Не удалось запустить Prometheus exporter: {e}")
 
-prometheus_thread = threading.Thread(target=start_prometheus_server, daemon=True)
-prometheus_thread.start()
-# ---------------------------------------------------------
+# --- Поток 1: Генератор Кадров ---
+def frame_generator_thread_func(
+        source_mode,
+        cpu_mon_instance, 
+        prom_mon_instance, 
+        target_interval):
+    print("[GeneratorThread] Запущен.")
+    current_cpu_monitor_instance = cpu_mon_instance
+    current_prometheus_monitor_instance = prom_mon_instance
+    
+    sct_instance_local = None
+    if source_mode == "SCREEN_CAPTURE":
+        try:
+            sct_instance_local = mss.mss()
+            print("[GeneratorThread] mss.mss() инициализирован в потоке генератора.")
+        except Exception as e:
+            print(f"[GeneratorThread] КРИТИЧЕСКАЯ ОШИБКА: Не удалось инициализировать mss.mss() в потоке: {e}")
+            stop_event.set() 
+            return 
 
+    while not stop_event.is_set():
+        loop_start_time = time.monotonic()
+        current_q_size = frames_queue.qsize()
+        QUEUE_SIZE_FRAMES.observe(current_q_size) 
 
-# Настройка TCP сервера
-server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-server_socket.bind(('', ESP32_PORT))
-server_socket.listen(1)
-print(f"[*] Ожидание подключения ESP32 на порту {ESP32_PORT}...")
-
-# --- Выбор источника изображения (раскомментируйте один) ---
-IMAGE_SOURCE_MODE = "SCREEN_CAPTURE" # "SCREEN_CAPTURE", "BIOS", "CPU_MONITOR", "PROMETHEUS_MONITOR"
-# ----------------------------------------------------------
-
-try:
-    conn, addr = server_socket.accept()
-    print(f"[*] ESP32 подключен: {addr}")
-    RECONNECTIONS_TOTAL.inc()
-
-    # Инициализация генераторов один раз
-    cpu_monitor_instance = None
-    prometheus_monitor_instance = None
-
-    if IMAGE_SOURCE_MODE == "CPU_MONITOR":
-        cpu_monitor_instance = CpuMonitorGenerator()
-    elif IMAGE_SOURCE_MODE == "PROMETHEUS_MONITOR":
-        prometheus_monitor_instance = PrometheusMonitorGenerator()
-
-    with mss.mss() as sct:
-        while True:
-            frame_loop_start_time = time.monotonic() # Начало полного цикла обработки кадра
-            total_chunks_current_frame = 0
-
-            # 1. Получение/Генерация изображения
+        if current_q_size < GENERATOR_LOW_WATER_MARK:
             capture_gen_start_time = time.monotonic()
-            if IMAGE_SOURCE_MODE == "SCREEN_CAPTURE":
-                try:
-                    sct_img_bgra = sct.grab(CAPTURE_REGION)
-                    curr_image_full = Image.frombytes('RGB', (sct_img_bgra.width, sct_img_bgra.height), sct_img_bgra.rgb, 'raw', 'RGB') # BGR to RGB
-                except mss.ScreenShotError as e:
-                    print(f"Ошибка захвата экрана: {e}")
-                    time.sleep(1)
-                    continue
-                FRAME_PROCESSING_TIME.labels(stage='capture_screen').observe(time.monotonic() - capture_gen_start_time)
-            elif IMAGE_SOURCE_MODE == "BIOS":
+            generated_image = None
+
+            if source_mode == "SCREEN_CAPTURE":
+                if sct_instance_local: 
+                    try:
+                        sct_img_bgra = sct_instance_local.grab(CAPTURE_REGION)
+                        generated_image = Image.frombytes('RGB', (sct_img_bgra.width, sct_img_bgra.height), sct_img_bgra.rgb, 'raw', 'RGB')
+                        FRAME_PROCESSING_TIME.labels(stage='capture_screen_thread').observe(time.monotonic() - capture_gen_start_time)
+                    except mss.ScreenShotError as e:
+                        print(f"[GeneratorThread] Ошибка захвата экрана: {e}")
+                        stop_event.wait(0.5) 
+                        continue
+                    except Exception as e: 
+                        print(f"[GeneratorThread] Неожиданная ошибка mss.grab: {e}")
+                        stop_event.set() 
+                        break 
+                else:
+                    print(f"[GeneratorThread] Экземпляр mss не доступен для SCREEN_CAPTURE. Остановка.")
+                    stop_event.set()
+                    break 
+            elif source_mode == "BIOS":
                 my_image = Image.new('RGB', DEFAULT_BIOS_RESOLUTION)
-                curr_image_full = draw_bios_on_image(my_image)
-                FRAME_PROCESSING_TIME.labels(stage='generate_bios').observe(time.monotonic() - capture_gen_start_time)
-            elif IMAGE_SOURCE_MODE == "CPU_MONITOR" and cpu_monitor_instance:
-                curr_image_full = Image.new('RGB', cpu_monitor_instance.resolution)
-                cpu_monitor_instance.draw_frame(curr_image_full)
-                FRAME_PROCESSING_TIME.labels(stage='generate_cpu_monitor').observe(time.monotonic() - capture_gen_start_time)
-            elif IMAGE_SOURCE_MODE == "PROMETHEUS_MONITOR" and prometheus_monitor_instance:
-                curr_image_full = Image.new('RGB', RESOLUTION, color=COLORS["background"])
-                prometheus_monitor_instance.generate_image_frame(curr_image_full) # Используем глобальные RESOLUTION и COLORS
-                FRAME_PROCESSING_TIME.labels(stage='generate_prometheus_monitor').observe(time.monotonic() - capture_gen_start_time)
+                generated_image = draw_bios_on_image(my_image)
+                FRAME_PROCESSING_TIME.labels(stage='generate_bios_thread').observe(time.monotonic() - capture_gen_start_time)
+            elif source_mode == "CPU_MONITOR" and current_cpu_monitor_instance:
+                generated_image = Image.new('RGB', current_cpu_monitor_instance.resolution)
+                current_cpu_monitor_instance.draw_frame(generated_image) 
+                FRAME_PROCESSING_TIME.labels(stage='generate_cpu_monitor_thread').observe(time.monotonic() - capture_gen_start_time)
+            elif source_mode == "PROMETHEUS_MONITOR" and current_prometheus_monitor_instance:
+                generated_image = Image.new('RGB', current_prometheus_monitor_instance.resolution, color=current_prometheus_monitor_instance._colors["background"])
+                current_prometheus_monitor_instance.generate_image_frame(generated_image)
+                FRAME_PROCESSING_TIME.labels(stage='generate_prometheus_monitor_thread').observe(time.monotonic() - capture_gen_start_time)
             else:
-                print(f"Неизвестный или неинициализированный IMAGE_SOURCE_MODE: {IMAGE_SOURCE_MODE}")
-                time.sleep(1)
-                continue
+                print(f"[GeneratorThread] Неизвестный или неинициализированный IMAGE_SOURCE_MODE: {source_mode}. Остановка.")
+                stop_event.set() 
+                break 
 
+            if generated_image:
+                try:
+                    frames_queue.put(generated_image, timeout=0.1) 
+                    FRAMES_GENERATED.inc()
+                except queue.Full:
+                    pass 
+            
+            elapsed_this_loop = time.monotonic() - loop_start_time
+            sleep_duration = target_interval - elapsed_this_loop
+            if sleep_duration > 0:
+                stop_event.wait(sleep_duration)
+        else:
+            stop_event.wait(0.01) 
 
-            # 2. Масштабирование до целевого разрешения
+    if sct_instance_local and hasattr(sct_instance_local, 'close'): 
+        try:
+            sct_instance_local.close()
+            print("[GeneratorThread] mss.mss() экземпляр закрыт.")
+        except Exception as e:
+            print(f"[GeneratorThread] Ошибка при закрытии mss.mss(): {e}")
+            
+    print("[GeneratorThread] Остановлен.")
+
+# --- Поток 2: Обработчик и Отправщик Кадров ---
+def frame_consumer_thread_func(client_conn):
+    global current_dynamic_threshold 
+    global frame_processing_times_history
+
+    print("[ConsumerThread] Запущен.")
+    prev_processed_image = None 
+
+    CURRENT_DYNAMIC_THRESHOLD_VALUE.set(current_dynamic_threshold)
+    CONSUMER_CALCULATED_FPS.set(0) # Начальное значение для FPS
+
+    while not stop_event.is_set():
+        try:
+            raw_frame = frames_queue.get(timeout=0.1)
+            QUEUE_SIZE_FRAMES.observe(frames_queue.qsize()) 
+
+            actual_processing_start_time = time.monotonic() 
+            
             resize_start_time = time.monotonic()
-            curr_image_resized = curr_image_full.resize((TARGET_WIDTH, TARGET_HEIGHT), Image.Resampling.LANCZOS)
-            FRAME_PROCESSING_TIME.labels(stage='resize').observe(time.monotonic() - resize_start_time)
+            curr_image_resized = raw_frame.resize((TARGET_WIDTH, TARGET_HEIGHT), Image.Resampling.LANCZOS)
+            FRAME_PROCESSING_TIME.labels(stage='resize_thread').observe(time.monotonic() - resize_start_time)
 
-            # 3. Поиск измененных областей (color_correction и rgb565_conversion будут вызываться внутри image_to_rgb565_bytes)
-            dirty_rects = list(find_dirty_rects(prev_image, curr_image_resized))
-
-            # 4. Отправка изменений
+            dirty_rects = list(find_dirty_rects(prev_processed_image, curr_image_resized, threshold=current_dynamic_threshold)) 
+            
+            total_dirty_rects_send_time_start = 0 
+            if dirty_rects: 
+                total_dirty_rects_send_time_start = time.monotonic()
+            
+            total_chunks_current_frame = 0
             if dirty_rects:
-                total_chunks_current_frame = 0
                 for (x, y, w, h) in dirty_rects:
-                    chunking_crop_start_time = time.monotonic()
-                    full_rect_data_size = w * h * 2
+                    full_rect_data_size = w * h * 2 
                     if full_rect_data_size > MAX_CHUNK_DATA_SIZE:
                         bytes_per_row = w * 2
-                        if bytes_per_row == 0: # Избегаем деления на ноль, если w=0
-                             print(f"      ПРЕДУПРЕЖДЕНИЕ: Ширина области {w} равна нулю. Пропуск чанка.")
-                             continue
-                        if bytes_per_row > MAX_CHUNK_DATA_SIZE : # Это условие должно проверяться до bytes_per_row == 0
-                            print(f"      ОШИБКА: Ширина {w} ({bytes_per_row} байт/строка) уже больше MAX_CHUNK_DATA_SIZE ({MAX_CHUNK_DATA_SIZE})! Увеличьте MAX_CHUNK_DATA_SIZE или уменьшите ширину захвата.")
-                            continue
-
+                        if bytes_per_row == 0: continue
+                        if bytes_per_row > MAX_CHUNK_DATA_SIZE: continue
+                        
                         chunk_h = MAX_CHUNK_DATA_SIZE // bytes_per_row
                         if chunk_h == 0: chunk_h = 1
 
                         for current_y_offset in range(0, h, chunk_h):
                             actual_chunk_h = min(chunk_h, h - current_y_offset)
-                            chunk_x = x
-                            chunk_y = y + current_y_offset
-                            chunk_w = w
-
+                            chunk_x, chunk_y, chunk_w = x, y + current_y_offset, w
+                            
+                            current_chunk_crop_time_start = time.monotonic()
                             chunk_img = curr_image_resized.crop((chunk_x, chunk_y, chunk_x + chunk_w, chunk_y + actual_chunk_h))
-                            FRAME_PROCESSING_TIME.labels(stage='chunking_and_crop').observe(time.monotonic() - chunking_crop_start_time) # Время на один чанк
-
-                            # Конвертация и упаковка измеряются внутри функций image_to_rgb565_bytes и pack_update_packet
+                            FRAME_PROCESSING_TIME.labels(stage='chunking_and_crop_thread').observe(time.monotonic() - current_chunk_crop_time_start)
+                            
                             chunk_data_rgb565 = image_to_rgb565_bytes(chunk_img)
                             packet = pack_update_packet(chunk_x, chunk_y, chunk_w, actual_chunk_h, chunk_data_rgb565)
-
                             send_start_time = time.monotonic()
                             try:
-                                conn.sendall(packet)
-                                FRAME_PROCESSING_TIME.labels(stage='send_packet').observe(time.monotonic() - send_start_time)
+                                client_conn.sendall(packet)
+                                FRAME_PROCESSING_TIME.labels(stage='send_packet_thread').observe(time.monotonic() - send_start_time)
                                 total_chunks_current_frame += 1
                             except socket.error as e:
-                                print(f"Ошибка отправки чанка: {e}")
-                                CONNECTION_ERRORS.inc()
-                                conn = None
-                                break
-                            chunking_crop_start_time = time.monotonic() # Сброс для следующего чанка
-                        # --- Конец цикла по чанкам ---
-                        if conn is None: break
-
-                    else: # Область достаточно мала
-                        FRAME_PROCESSING_TIME.labels(stage='chunking_and_crop').observe(time.monotonic() - chunking_crop_start_time) # Время на одну "не-чанкованную" область
+                                print(f"[ConsumerThread] Ошибка отправки чанка: {e}")
+                                CONNECTION_ERRORS.inc(); stop_event.set(); break 
+                        if stop_event.is_set(): break 
+                    else: 
+                        current_region_crop_time_start = time.monotonic()
                         region_img = curr_image_resized.crop((x, y, x + w, y + h))
+                        FRAME_PROCESSING_TIME.labels(stage='chunking_and_crop_thread').observe(time.monotonic() - current_region_crop_time_start)
+                        
                         region_data_rgb565 = image_to_rgb565_bytes(region_img)
                         packet = pack_update_packet(x, y, w, h, region_data_rgb565)
-
                         send_start_time = time.monotonic()
                         try:
-                            conn.sendall(packet)
-                            FRAME_PROCESSING_TIME.labels(stage='send_packet').observe(time.monotonic() - send_start_time)
+                            client_conn.sendall(packet)
+                            FRAME_PROCESSING_TIME.labels(stage='send_packet_thread').observe(time.monotonic() - send_start_time)
                             total_chunks_current_frame += 1
                         except socket.error as e:
-                            print(f"Ошибка отправки: {e}")
-                            CONNECTION_ERRORS.inc()
-                            conn = None
-                            break
-                if total_chunks_current_frame > 0 : # Записываем только если были чанки
-                    CHUNKS_PER_FRAME.observe(total_chunks_current_frame)
+                            print(f"[ConsumerThread] Ошибка отправки: {e}")
+                            CONNECTION_ERRORS.inc(); stop_event.set(); break 
+            
+            if dirty_rects and total_dirty_rects_send_time_start > 0: 
+                DIRTY_RECTS_SEND_DURATION.observe(time.monotonic() - total_dirty_rects_send_time_start)
+            
+            if total_chunks_current_frame > 0: 
+                CHUNKS_PER_FRAME.observe(total_chunks_current_frame)
+            
+            if stop_event.is_set(): 
+                break
 
+            prev_processed_image = curr_image_resized 
+            FRAMES_PROCESSED.inc()
+            
+            current_frame_actual_processing_time = time.monotonic() - actual_processing_start_time
+            frame_processing_times_history.append(current_frame_actual_processing_time)
 
-            if conn is None:
-                print("Соединение потеряно, ожидание нового подключения...")
-                prev_image = None
-                # Закрываем старое соединение перед новым accept, если оно еще не None
-                # (хотя в данном потоке оно уже должно быть None)
-                # if conn:
-                # try:
-                # conn.close()
-                # except Exception:
-                # pass # Игнорируем ошибки при закрытии уже разорванного сокета
-                conn, addr = server_socket.accept()
-                print(f"[*] ESP32 переподключен: {addr}")
-                RECONNECTIONS_TOTAL.inc()
-                continue
+            if len(frame_processing_times_history) == FPS_HISTORY_SIZE:
+                avg_processing_time = sum(frame_processing_times_history) / FPS_HISTORY_SIZE
+                current_fps = 0.0 # Значение по умолчанию
+                if avg_processing_time > 0:
+                    current_fps = 1.0 / avg_processing_time
+                
+                CONSUMER_CALCULATED_FPS.set(current_fps) # Обновляем метрику FPS
 
-            prev_image = curr_image_resized
+                hysteresis = TARGET_FPS * FPS_HYSTERESIS_FACTOR
+                old_threshold = current_dynamic_threshold 
+                if current_fps < TARGET_FPS - hysteresis and avg_processing_time > 0: # Добавил проверку avg_processing_time > 0
+                    current_dynamic_threshold = min(MAX_DIRTY_RECT_THRESHOLD, 
+                                                    current_dynamic_threshold + THRESHOLD_ADJUSTMENT_STEP_UP)
+                elif current_fps > TARGET_FPS + hysteresis:
+                    current_dynamic_threshold = max(MIN_DIRTY_RECT_THRESHOLD, 
+                                                    current_dynamic_threshold - THRESHOLD_ADJUSTMENT_STEP_DOWN)
+                
+                if old_threshold != current_dynamic_threshold: 
+                    CURRENT_DYNAMIC_THRESHOLD_VALUE.set(current_dynamic_threshold)
+            
+            frames_queue.task_done() 
+            FRAME_PROCESSING_TIME.labels(stage='full_consumer_loop_thread').observe(time.monotonic() - actual_processing_start_time)
 
-            # Общее время на обработку и отправку одного кадра
-            FRAME_PROCESSING_TIME.labels(stage='full_frame_loop').observe(time.monotonic() - frame_loop_start_time)
-
-            elapsed_time = time.monotonic() - frame_loop_start_time # Используем monotonic для измерения длительности
-            sleep_time = UPDATE_INTERVAL_SEC - elapsed_time
-            if sleep_time > 0:
-                time.sleep(sleep_time)
-
-except KeyboardInterrupt:
-    print("\n[*] Завершение работы...")
-finally:
-    if cpu_monitor_instance:
-        cpu_monitor_instance.stop()
-    if prometheus_monitor_instance:
-        prometheus_monitor_instance.stop()
-    if conn:
-        try:
-            conn.close()
+        except queue.Empty:
+            # Если очередь пуста, FPS может временно не обновляться, 
+            # но последнее известное значение останется в метрике.
+            # Можно добавить CONSUMER_CALCULATED_FPS.set(0) здесь, если нужно явно показывать 0 FPS при простое.
+            continue 
+        except socket.error as e: 
+            print(f"[ConsumerThread] Критическая ошибка сокета в основном цикле: {e}")
+            CONNECTION_ERRORS.inc()
+            stop_event.set()
+            CONSUMER_CALCULATED_FPS.set(0) # Сбрасываем FPS при ошибке
+            break 
         except Exception as e:
-            print(f"Ошибка при закрытии соединения с ESP32: {e}")
-        print("[*] Соединение с ESP32 закрыто.")
+            print(f"[ConsumerThread] Неожиданная ошибка: {e}")
+            import traceback
+            traceback.print_exc()
+            stop_event.set() 
+            CONSUMER_CALCULATED_FPS.set(0) # Сбрасываем FPS при ошибке
+            break
+
+    print("[ConsumerThread] Остановлен.")
+
+# --- Основная логика (main) ---
+def main():
+    cpu_monitor_instance = None
+    prometheus_monitor_instance = None
+
+    prometheus_http_thread = threading.Thread(target=start_prometheus_server, daemon=True)
+    prometheus_http_thread.start()
+
     try:
-        server_socket.close()
+        if IMAGE_SOURCE_MODE == "CPU_MONITOR":
+            cpu_monitor_instance = CpuMonitorGenerator() 
+        elif IMAGE_SOURCE_MODE == "PROMETHEUS_MONITOR":
+            prometheus_monitor_instance = PrometheusMonitorGenerator()
+        
+        server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        server_socket.settimeout(1.0) 
+        server_socket.bind(('', ESP32_PORT))
+        server_socket.listen(1)
+        print(f"[*] Ожидание подключения ESP32 на порту {ESP32_PORT}...")
+
+        conn_esp32 = None
+        generator_thread_instance = None 
+        consumer_thread_instance = None  
+
+        while not stop_event.is_set():
+            if conn_esp32 is None: 
+                while not frames_queue.empty():
+                    try: frames_queue.get_nowait(); frames_queue.task_done()
+                    except queue.Empty: break
+                
+                if consumer_thread_instance and consumer_thread_instance.is_alive():
+                    print("[MainLoop] Ожидание завершения предыдущего потока потребителя...")
+                    consumer_thread_instance.join(timeout=1)
+                if generator_thread_instance and generator_thread_instance.is_alive():
+                    print("[MainLoop] Ожидание завершения предыдущего потока генератора...")
+                    generator_thread_instance.join(timeout=1)
+
+                if stop_event.is_set(): break
+                
+                try:
+                    conn_esp32, addr_esp32_conn = server_socket.accept() 
+                    conn_esp32.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1) 
+                    conn_esp32.settimeout(2.0) 
+                    print(f"[*] ESP32 подключен: {addr_esp32_conn}")
+                    RECONNECTIONS_TOTAL.inc()
+                    
+                    # global current_dynamic_threshold # Уже глобальная
+                    # current_dynamic_threshold = MIN_DIRTY_RECT_THRESHOLD # Опциональный сброс при каждом новом подключении
+                    CURRENT_DYNAMIC_THRESHOLD_VALUE.set(current_dynamic_threshold)
+                    CONSUMER_CALCULATED_FPS.set(0) # Сброс FPS для нового соединения
+
+                    generator_thread_instance = threading.Thread(
+                        target=frame_generator_thread_func,
+                        args=(IMAGE_SOURCE_MODE, cpu_monitor_instance, prometheus_monitor_instance, GENERATOR_TARGET_INTERVAL_SEC),
+                        daemon=True 
+                    )
+                    consumer_thread_instance = threading.Thread(
+                        target=frame_consumer_thread_func,
+                        args=(conn_esp32,),
+                        daemon=True
+                    )
+                    generator_thread_instance.start()
+                    consumer_thread_instance.start()
+
+                except socket.timeout:
+                    continue 
+                except Exception as e:
+                    print(f"[MainLoop] Ошибка при подключении клиента: {e}")
+                    if conn_esp32: 
+                        try: conn_esp32.close()
+                        except: pass
+                    conn_esp32 = None
+                    time.sleep(1) 
+                    continue
+            
+            elif generator_thread_instance and consumer_thread_instance: 
+                if not consumer_thread_instance.is_alive(): 
+                    print("[MainLoop] Поток потребителя завершился.")
+                    if not stop_event.is_set():
+                        print("[MainLoop] Потребитель умер, а stop_event не установлен. Устанавливаю stop_event.")
+                        stop_event.set() # Если потребитель умер, вероятно, что-то не так, останавливаем всё.
+
+                    if conn_esp32:
+                        try: conn_esp32.close()
+                        except: pass
+                    conn_esp32 = None 
+                    if generator_thread_instance.is_alive(): 
+                         generator_thread_instance.join(timeout=1)
+                    if stop_event.is_set(): break 
+
+                elif not generator_thread_instance.is_alive():
+                    print("[MainLoop] Поток генератора неожиданно завершился!")
+                    if not stop_event.is_set(): stop_event.set() 
+                    break 
+                time.sleep(0.5) 
+
+    except KeyboardInterrupt:
+        print("\n[*] Завершение работы по KeyboardInterrupt...")
+        if not stop_event.is_set(): stop_event.set() 
     except Exception as e:
-        print(f"Ошибка при закрытии серверного сокета: {e}")
-    print("[*] Серверный сокет закрыт.")
-    print("[*] Prometheus exporter поток также должен завершиться (daemon).")
+        print(f"[MainLoop] Критическая ошибка: {e}")
+        import traceback
+        traceback.print_exc()
+        if not stop_event.is_set(): stop_event.set() 
+    finally:
+        print("[*] Начало процедуры остановки...")
+        if not stop_event.is_set(): 
+            stop_event.set()
+
+        if cpu_monitor_instance and hasattr(cpu_monitor_instance, 'stop'):
+            print("[*] Остановка CPU монитора...")
+            cpu_monitor_instance.stop()
+        if prometheus_monitor_instance and hasattr(prometheus_monitor_instance, 'stop'):
+            print("[*] Остановка Prometheus монитора...")
+            prometheus_monitor_instance.stop()
+
+        if 'generator_thread_instance' in locals() and generator_thread_instance and generator_thread_instance.is_alive():
+            print("[*] Ожидание остановки потока генератора...")
+            generator_thread_instance.join(timeout=2)
+            if generator_thread_instance.is_alive(): print("[!] Поток генератора не остановился корректно.")
+        
+        if 'consumer_thread_instance' in locals() and consumer_thread_instance and consumer_thread_instance.is_alive():
+            print("[*] Ожидание остановки потока потребителя...")
+            consumer_thread_instance.join(timeout=3) 
+            if consumer_thread_instance.is_alive(): print("[!] Поток потребителя не остановился корректно.")
+
+        if 'conn_esp32' in locals() and conn_esp32: 
+            try:
+                print("[*] Закрытие соединения с ESP32...")
+                conn_esp32.close()
+            except Exception as e:
+                print(f"Ошибка при закрытии соединения с ESP32: {e}")
+        
+        if 'server_socket' in locals() and server_socket: 
+            try:
+                print("[*] Закрытие серверного сокета...")
+                server_socket.close()
+            except Exception as e:
+                print(f"Ошибка при закрытии серверного сокета: {e}")
+        
+        if 'prometheus_http_thread' in locals() and prometheus_http_thread and prometheus_http_thread.is_alive():
+             print("[*] Prometheus HTTP сервер (daemon) должен завершиться автоматически.")
+
+        print("[*] Сервер полностью остановлен.")
+
+if __name__ == "__main__":
+    main()
