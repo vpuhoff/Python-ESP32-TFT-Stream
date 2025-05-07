@@ -1,6 +1,6 @@
 # ESP32-C3 Real-time Screen/Data Streaming Client/Server
 
-This project demonstrates streaming visual data in real-time from a PC to an ESP32-C3 microcontroller equipped with a TFT display. The Python server on the PC can capture a selected screen region, or generate various data visualizations (like a BIOS-style screen, CPU monitor, or Prometheus metrics dashboard). An Arduino sketch on the ESP32-C3 receives and renders this stream over a TCP connection. Differential updates are used for screen capture to minimize latency and bandwidth usage, and server-side color correction options are included for better display fidelity.
+This project demonstrates streaming visual data in real-time from a PC to an ESP32-C3 microcontroller equipped with a TFT display. The multi-threaded Python server on the PC can capture a selected screen region or generate various data visualizations (like a BIOS-style screen, CPU monitor, or Prometheus metrics dashboard). An Arduino sketch on the ESP32-C3 receives and renders this stream over a TCP connection. Differential updates with an adaptive threshold are used to minimize latency and bandwidth, optimizing for visual quality versus frame rate. Server-side color correction options are included for better display fidelity.
 
 * Wiki: [https://deepwiki.com/vpuhoff/Python-ESP32-TFT-Stream](https://deepwiki.com/vpuhoff/Python-ESP32-TFT-Stream/1-overview)
 
@@ -12,15 +12,17 @@ This project demonstrates streaming visual data in real-time from a PC to an ESP
     * Generates and streams a real-time CPU usage monitor.
     * Generates and streams a dashboard of system metrics collected from a Prometheus instance.
 * Displays the stream on an ESP32-C3 driven TFT screen (using the TFT_eSPI library).
-* Uses TCP for low-latency communication.
-* Implements differential updates (sending only changed screen regions) for screen capture efficiency.
+* Uses TCP for communication with `TCP_NODELAY` enabled for potentially lower latency.
+* **Advanced Differential Updates:**
+    * Implements differential updates (sending only changed screen regions).
+    * Features an **adaptive threshold** for `dirty_rect` detection, dynamically balancing image quality and frame rate based on processing performance.
 * Handles large updates by chunking them into smaller packets.
 * Includes server-side gamma and white balance correction for fine-tuning color reproduction.
-* Python server for data capture/generation and processing.
+* **Multi-threaded Python Server:** Utilizes separate threads for frame generation and frame processing/sending, improving responsiveness and throughput.
 * Arduino client for receiving and rendering on ESP32.
-* Configurable resolution, capture area (for screen streaming), and update rate.
+* Configurable resolution, capture area (for screen streaming), and target FPS for adaptive threshold.
 * Handles connection drops and attempts reconnection with visual feedback on ESP32.
-* **Prometheus Exporter:** The Python server includes a Prometheus exporter to monitor its own performance (e.g., processing times for different stages, packet sizes).
+* **Comprehensive Prometheus Exporter:** The Python server includes a Prometheus exporter to monitor its own performance in detail (e.g., processing times for different stages, packet sizes, queue lengths, calculated FPS, adaptive threshold value).
 
 ## Hardware Requirements
 
@@ -89,8 +91,13 @@ This project demonstrates streaming visual data in real-time from a PC to an ESP
         * `PROMETHEUS_EXPORTER_PORT`: Port for the server's own performance metrics (default: `8000`).
         * `ESP32_PORT`: The port to listen on for ESP32 connections (must match ESP32 sketch). Default: `8888`.
         * `TARGET_WIDTH`, `TARGET_HEIGHT`: The resolution of the ESP32's display.
-        * `UPDATE_INTERVAL_SEC`: Time between frame updates.
+        * `GENERATOR_TARGET_INTERVAL_SEC`: Approximate interval for the frame generation thread (e.g., `0.05` for 20 FPS target generation rate if resources allow).
         * `MAX_CHUNK_DATA_SIZE`: Maximum size (in bytes) of pixel data per network packet.
+        * **Adaptive Threshold Settings:**
+            * `TARGET_FPS`: Desired FPS for the consumer thread, influences threshold adaptation.
+            * `MIN_DIRTY_RECT_THRESHOLD`, `MAX_DIRTY_RECT_THRESHOLD`: Range for the adaptive threshold.
+            * `THRESHOLD_ADJUSTMENT_STEP_UP`, `THRESHOLD_ADJUSTMENT_STEP_DOWN`: How aggressively the threshold changes.
+            * `FPS_HISTORY_SIZE`, `FPS_HYSTERESIS_FACTOR`: Parameters for FPS calculation and adaptation stability.
         * **For Screen Capture:**
             * `CAPTURE_REGION`: Dictionary defining the screen area to capture.
         * **For Prometheus Monitor:**
@@ -107,72 +114,81 @@ This project demonstrates streaming visual data in real-time from a PC to an ESP
     ```bash
     python server.py
     ```
-    The server will start listening for a connection from the ESP32 and begin exposing its own metrics on `http://localhost:PROMETHEUS_EXPORTER_PORT`.
+    The server will start listening for a connection from the ESP32 and begin exposing its own metrics on `http://localhost:PROMETHEUS_EXPORTER_PORT` (or your PC's IP).
 4.  **Start Client:** Power on or reset your ESP32-C3 board.
     * It will connect to Wi-Fi.
     * It will display an initial screen showing its IP address and connection status.
     * It will then attempt to connect to the configured `server_ip` and `server_port`.
 5.  **Streaming:** Once the ESP32 connects, the TFT display should start showing the content generated or captured by the Python server.
-6.  **(Optional) Monitor Server Performance**: Point your Prometheus instance to scrape `http://<PC_IP_ADDRESS>:PROMETHEUS_EXPORTER_PORT` to collect server performance metrics. Visualize them using Grafana or the Prometheus UI.
+6.  **(Optional) Monitor Server Performance**: Point your Prometheus instance to scrape `http://<PC_IP_ADDRESS>:PROMETHEUS_EXPORTER_PORT` to collect server performance metrics. Visualize them using Grafana or the Prometheus UI. Key metrics include `esp32_consumer_calculated_fps` and `esp32_current_dynamic_threshold`.
 
 ## How It Works
 
-1.  **TCP Connection:** ESP32 client connects to Python server.
-2.  **Data Generation/Capture (Python):**
-    * **Screen Capture:** `mss` captures the screen region.
-    * **CPU Monitor:** `psutil` and `py-cpuinfo` gather CPU data, `Pillow` draws the visualization.
-    * **BIOS Screen:** `Pillow` draws a static BIOS-like image.
-    * **Prometheus Monitor:** `prometheus_api_client` fetches metrics, `graphics_engine.py` (using `Pillow`) renders the dashboard.
-3.  **Image Processing (Python):**
-    * **Resizing:** `Pillow` resizes the image to the target ESP32 display resolution.
-    * **Color Correction:** `numpy` and `Pillow` apply gamma and white balance.
-    * **Diffing (for Screen Capture & potentially other dynamic modes):** An optimized `numpy`-based algorithm compares the current frame to the previous to find changed rectangles (`dirty_rects`).
-4.  **Packetizing (Python):**
-    * **Chunking:** Large updates are split into smaller chunks if they exceed `MAX_CHUNK_DATA_SIZE`.
-    * **Formatting:** Each chunk/rectangle is converted to RGB565 pixel data. A header (X, Y, W, H, DataLen) is packed with the data using `struct` (Big-Endian).
-5.  **Transmission (Python):** Packets are sent over TCP to the ESP32.
-6.  **Reception & Rendering (ESP32):**
-    * The ESP32 client reads the TCP stream, parsing the 12-byte header.
-    * It reads the specified `DataLen` bytes of pixel data into a buffer.
-    * `TFT_eSPI.pushImage()` renders the received pixel data at the correct coordinates.
-7.  **Connection Management (ESP32):** The client handles connection state, retries on failure, and can redraw its initial status screen.
-8.  **Server Performance Monitoring (Python):** A `prometheus-client` HTTP server exposes internal performance metrics (durations of stages, packet sizes, etc.).
+1.  **TCP Connection:** ESP32 client connects to Python server. `TCP_NODELAY` is enabled.
+2.  **Multi-threaded Server Architecture (Python):**
+    * **Frame Generation Thread:** Captures or generates "raw" image frames based on `IMAGE_SOURCE_MODE`.
+        * Screen Capture: `mss` captures the screen region.
+        * CPU Monitor: `psutil` and `py-cpuinfo` gather data; `Pillow` draws.
+        * BIOS Screen: `Pillow` draws.
+        * Prometheus Monitor: `prometheus_api_client` fetches metrics; `graphics_engine.py` renders.
+        * Generated frames are placed into a thread-safe queue.
+    * **Frame Consumer Thread:**
+        * Retrieves raw frames from the queue.
+        * **Image Processing:**
+            * Resizing: `Pillow` resizes to target ESP32 resolution.
+            * Color Correction: `numpy` and `Pillow` apply gamma/white balance.
+            * Diffing: An `numpy`-based algorithm compares with the previous frame to find `dirty_rects` using an **adaptive threshold** based on current processing FPS.
+        * **Packetizing & Transmission:**
+            * Changed regions are converted to RGB565.
+            * Large updates are chunked.
+            * Headers (X, Y, W, H, DataLen) are packed.
+            * Packets sent via TCP to ESP32.
+        * **Adaptive Threshold Control:** Adjusts the `dirty_rect` threshold to maintain a target FPS.
+3.  **Reception & Rendering (ESP32):**
+    * Client reads TCP stream, parses header, reads pixel data.
+    * `TFT_eSPI.pushImage()` renders data.
+4.  **Connection Management (ESP32):** Handles connection state and retries.
+5.  **Server Performance Monitoring (Python):** `prometheus-client` exposes internal metrics (stage durations, FPS, threshold, queue size, etc.).
 
 ## Troubleshooting
 
-* **ESP32 Cannot Connect:** Check `server_ip` in ESP32 code, ensure the server is running on the PC, check firewall settings on PC, verify Wi-Fi network and credentials.
+* **ESP32 Cannot Connect:** Check `server_ip` in ESP32 code, server running, PC firewall, Wi-Fi.
 * **ESP32 Reboots / Crashes:** Check for Out of Memory (try reducing `PIXEL_BUFFER_SIZE` on ESP32), verify TFT_eSPI pin configuration and driver.
-* **ESP32 "Exceeds buffer size" error:** Ensure `MAX_CHUNK_DATA_SIZE` (Python) is less than or equal to `PIXEL_BUFFER_SIZE` (ESP32).
+* **ESP32 "Exceeds buffer size" error:** Ensure `MAX_CHUNK_DATA_SIZE` (Python) <= `PIXEL_BUFFER_SIZE` (ESP32).
 * **Display Blank / Garbage / Wrong Colors:**
-    * Double-check TFT_eSPI configuration (`User_Setup.h`) for correct pins and display driver.
-    * Verify wiring between ESP32 and TFT.
+    * **Crucial: Double-check TFT_eSPI configuration (`User_Setup.h`) for pins and driver.**
+    * Verify wiring.
     * Adjust `tft.invertDisplay(true/false)` in ESP32 `setup()`.
-    * Fine-tune `GAMMA` and `WB_SCALE` settings in `server.py` for color accuracy.
-* **Slow / Laggy Performance:**
-    * If using screen capture: high resolution/large capture area, low `UPDATE_INTERVAL_SEC` (too fast).
-    * Slow Wi-Fi network.
-    * Inefficient server processing (check Prometheus metrics for `server.py` if enabled, particularly `diff_calculation` or specific generator times).
-    * Low TFT SPI speed (configurable in `TFT_eSPI` library, but requires careful tuning).
+    * Fine-tune `GAMMA` and `WB_SCALE` in `server.py`.
+* **Slow / Laggy Performance / High Latency:**
+    * Check server Prometheus metrics: `esp32_consumer_calculated_fps` (is it near `TARGET_FPS`?), `esp32_dirty_rects_send_duration_seconds` (is network send slow?), `esp32_current_dynamic_threshold` (is it very high, indicating struggle?).
+    * High resolution/large capture area, or very frequent updates from the source generator.
+    * Slow Wi-Fi.
+    * Inefficient ESP32-side processing/rendering.
+    * Try adjusting `TARGET_FPS` and threshold range (`MIN_DIRTY_RECT_THRESHOLD`, `MAX_DIRTY_RECT_THRESHOLD`) in `server.py`.
+* **Too Many Artifacts / Blocky Updates:**
+    * The `current_dynamic_threshold` might be too high. Try increasing `TARGET_FPS` to encourage a lower threshold, or narrow the `MAX_DIRTY_RECT_THRESHOLD`.
 * **Prometheus Monitor Issues:**
-    * Ensure Prometheus server is running and accessible from the PC running `server.py`.
-    * Verify PromQL queries in `prometheus_monitor_generator.py` are correct for your Prometheus setup and exporters.
-    * Check that the necessary exporters (e.g., `node_exporter`, `windows_exporter`) are running and providing data to Prometheus.
+    * Prometheus server running and accessible.
+    * Correct PromQL queries in `prometheus_monitor_generator.py`.
+    * Necessary exporters running.
+* **`mss` related errors in `frame_generator_thread_func`:** Ensure `mss` is correctly initialized within the thread if capturing screen. The current code does this.
 
 ## TODO / Potential Improvements
 
 * Further optimize `find_dirty_rects` (e.g., merging adjacent small dirty rectangles).
-* Implement reliable specific window capture on the server for screen streaming.
-* Add options for different pixel formats (e.g., grayscale to reduce data).
-* Implement basic lossless compression for pixel data (e.g., Run-Length Encoding).
+* Implement reliable specific window capture on the server.
+* Add options for different pixel formats (e.g., grayscale).
+* Explore simple lossless compression (e.g., Run-Length Encoding) if beneficial.
 * Make server settings configurable via command-line arguments or a configuration file.
-* Explore using WebSockets or MQTT for communication as alternatives to raw TCP.
-* Implement dithering during RGB565 conversion in Python for potentially smoother gradients on the TFT.
-* Add more sophisticated error handling and reporting on both client and server.
-* Allow dynamic selection of `IMAGE_SOURCE_MODE` without restarting the server (e.g., via a simple command interface).
+* Implement dithering during RGB565 conversion for smoother gradients.
+* More sophisticated error handling and reporting.
+* Allow dynamic selection of `IMAGE_SOURCE_MODE` without restarting the server.
+* Refine the adaptive threshold algorithm for smoother transitions and better target FPS adherence.
 
 ## License
 
-This project is released under the MIT License. 
+This project is released under the MIT License.
 
 ## Acknowledgements
 
