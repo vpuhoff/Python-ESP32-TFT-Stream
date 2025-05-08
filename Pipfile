@@ -13,6 +13,7 @@ py-cpuinfo = "*"
 structlog = "*"
 prometheus-api-client = "*"
 prometheus-client = "*"
+pyyaml = "*"
 
 [dev-packages]
 

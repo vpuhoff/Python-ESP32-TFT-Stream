@@ -4,461 +4,453 @@ import time
 import threading
 import math
 from collections import deque
-from PIL import Image # Still need Image to create the initial canvas
-# Import the new graphics engine
-from graphics_engine import MonitorGraphicsEngine
-# Prometheus client is still needed here
-from prometheus_api_client import PrometheusConnect
+from PIL import Image # Для создания начального холста
+# Импорт нового графического движка
+from graphics_engine import MonitorGraphicsEngine # Убедитесь, что graphics_engine.py доступен
+# Клиент Prometheus все еще нужен здесь
+from prometheus_api_client import PrometheusConnect, PrometheusApiClientException
+from copy import deepcopy # Для глубокого копирования словарей и списков
 
-# --- Configuration (Most remains here) ---
-PROMETHEUS_URL = "http://127.0.0.1:9090/"
-RESOLUTION = (640, 480)
-HISTORY_LENGTH = 120
-UPDATE_INTERVAL = 1.0
-FONT_PATH = "arial.ttf" # Graphics engine needs this path
+# --- Конфигурация по умолчанию для этого модуля (может быть переопределена извне) ---
+DEFAULT_PROMETHEUS_URL = "http://127.0.0.1:9090/"
+DEFAULT_RESOLUTION = (640, 480) # Это разрешение холста, на котором будет рисовать graphics_engine
+DEFAULT_HISTORY_LENGTH = 120    # Количество точек истории для хранения и отображения
+DEFAULT_UPDATE_INTERVAL = 1.0   # Интервал обновления данных Prometheus в секундах
+DEFAULT_FONT_PATH = "arial.ttf" # Путь к файлу шрифта по умолчанию
 
-# Font sizes are now passed to the graphics engine
-TITLE_FONT_SIZE = 18
-VALUE_FONT_SIZE = 36
-UNIT_FONT_SIZE = 20
-# GRAPH_POINTS = HISTORY_LENGTH # Implicitly HISTORY_LENGTH
+# Размеры шрифтов по умолчанию (будут переданы в graphics_engine)
+DEFAULT_TITLE_FONT_SIZE = 18
+DEFAULT_VALUE_FONT_SIZE = 36
+DEFAULT_UNIT_FONT_SIZE = 20
 
-# Colors are passed to the graphics engine
-MAIN_COLOR = (0, 255, 255) # Яркий циан/бирюзовый
-COLORS = {
+# Цвета по умолчанию (будут переданы в graphics_engine)
+DEFAULT_MAIN_COLOR = (0, 255, 255) # Яркий циан/бирюзовый
+DEFAULT_COLORS = {
     "background": (10, 15, 25),
     "foreground": (200, 220, 220),
-    "value_color": MAIN_COLOR,
-    "graph_line": MAIN_COLOR,
+    "value_color": DEFAULT_MAIN_COLOR,
+    "graph_line": DEFAULT_MAIN_COLOR, # Общий цвет для графиков по умолчанию
     "grid_lines": (80, 110, 140),
     "cell_border": (60, 80, 100),
-    "error":      (255, 80, 80),
+    "error": (255, 80, 80),
+    # Можно добавить специфичные цвета для графиков, если graphics_engine их ожидает
+    # "gpu_load_color": DEFAULT_MAIN_COLOR, # Пример
 }
-# Specific colors defined here, but used by graphics engine via METRIC_CONFIG
-GPU_LOAD_COLOR = COLORS["graph_line"]
-GPU_RAM_COLOR = COLORS["graph_line"]
-GPU_TEMP_COLOR = COLORS["graph_line"]
-CPU_LOAD_COLOR = COLORS["graph_line"]
-RAM_USAGE_COLOR = COLORS["graph_line"]
-DISK_WRITE_COLOR = COLORS["graph_line"]
-DISK_READ_COLOR = (0, 180, 200)
 
-# Metric Definitions (Remain here, passed to graphics engine)
-METRIC_CONFIG = {
+# Конфигурация метрик по умолчанию
+# Эта структура определяет, какие метрики запрашивать и как их отображать.
+# 'query_used' и 'query_total' для RAM, 'query_write' и 'query_read' для диска.
+DEFAULT_METRIC_CONFIG = {
     "gpu_load": {
         "title": "GPU LOAD",
-        "query": 'avg(nvidia_smi_utilization_gpu_ratio * 100)',
+        "query": 'avg(nvidia_smi_utilization_gpu_ratio * 100) or on() vector(0)', # or on() vector(0) для значения по умолчанию
         "unit": "%",
-        "color": GPU_LOAD_COLOR,
-        "range": (0, 100),
+        "color": DEFAULT_COLORS["graph_line"], # Используем общий цвет или можно задать специфичный
+        "range": (0, 100), # Диапазон для оси Y графика
     },
     "gpu_ram": {
         "title": "GPU RAM",
-        "query": 'avg(nvidia_smi_memory_used_bytes)/avg(nvidia_smi_memory_total_bytes)*100',
+        "query": 'avg(nvidia_smi_memory_used_bytes / nvidia_smi_memory_total_bytes * 100) or on() vector(0)',
         "unit": "%",
-        "color": GPU_RAM_COLOR,
+        "color": DEFAULT_COLORS["graph_line"],
         "range": (0, 100),
     },
     "gpu_temp": {
         "title": "GPU TEMP",
-        "query": 'avg(nvidia_smi_temperature_gpu)',
+        "query": 'avg(nvidia_smi_temperature_gpu) or on() vector(0)',
         "unit": "°C",
-        "color": GPU_TEMP_COLOR,
-        "range": (20, 100), # Example range
+        "color": DEFAULT_COLORS["graph_line"],
+        "range": (20, 100),
     },
     "cpu_load": {
         "title": "CPU LOAD",
-        "query": '(1 - avg(rate(windows_cpu_time_total{mode="idle"}[1m]))) * 100',
+        # Запрос для Windows. Для Linux/macOS используйте node_exporter метрики, например:
+        # 'avg(100 - (avg by (instance) (rate(node_cpu_seconds_total{mode="idle"}[1m])) * 100)) or on() vector(0)'
+        "query": '(1 - avg(rate(windows_cpu_time_total{mode="idle"}[1m]))) * 100 or on() vector(0)',
         "unit": "%",
-        "color": CPU_LOAD_COLOR,
+        "color": DEFAULT_COLORS["graph_line"],
         "range": (0, 100),
     },
     "ram_usage": {
         "title": "RAM USAGE",
-        "query_used": 'windows_os_visible_memory_bytes - windows_os_physical_memory_free_bytes',
-        "query_total": 'windows_os_visible_memory_bytes',
-        "unit": "GB", # Display unit
-        "color": RAM_USAGE_COLOR,
-        "range": None, # Dynamic range based on total
+        # Запросы для Windows. Для Linux/macOS:
+        # 'query_used': 'node_memory_MemTotal_bytes - node_memory_MemAvailable_bytes or on() vector(0)',
+        # 'query_total': 'node_memory_MemTotal_bytes or on() vector(0)',
+        "query_used": 'windows_os_visible_memory_bytes - windows_os_physical_memory_free_bytes or on() vector(0)',
+        "query_total": 'windows_os_visible_memory_bytes or on() vector(0)', # Используется для динамического диапазона графика
+        "unit": "GB", # Единица отображения значения
+        "color": DEFAULT_COLORS["graph_line"],
+        "range": None, # Динамический диапазон (0 до total RAM)
     },
     "disk_usage": {
         "title": "DISK R/W",
-        "query_write": 'sum(rate(windows_logical_disk_write_bytes_total[1m]))',
-        "query_read": 'sum(rate(windows_logical_disk_read_bytes_total[1m]))',
-        "unit": "B/s", # Base unit for display formatting
-        "color_write": DISK_WRITE_COLOR,
-        "color_read": DISK_READ_COLOR,
-        "range": None, # Dynamic range based on recent max
+        # Запросы для Windows. Для Linux/macOS:
+        # 'query_write': 'sum(rate(node_disk_written_bytes_total[1m])) or on() vector(0)',
+        # 'query_read': 'sum(rate(node_disk_read_bytes_total[1m])) or on() vector(0)',
+        "query_write": 'sum(rate(windows_logical_disk_write_bytes_total[1m])) or on() vector(0)',
+        "query_read": 'sum(rate(windows_logical_disk_read_bytes_total[1m])) or on() vector(0)',
+        "unit": "B/s", # Базовая единица для форматирования отображения
+        "color_write": DEFAULT_COLORS["graph_line"], # Можно задать разные цвета
+        "color_read": (0, 180, 200), # Пример другого цвета для чтения
+        "range": None, # Динамический диапазон на основе недавнего максимума
     },
 }
 
-# Grid Layout (Remains here, passed to graphics engine)
-GRID_LAYOUT = [
+# Расположение ячеек на сетке по умолчанию
+DEFAULT_GRID_LAYOUT = [
     ["gpu_load", "gpu_ram", "gpu_temp"],
     ["cpu_load", "ram_usage", "disk_usage"],
 ]
-# GRID_ROWS/COLS are calculated within graphics engine now
-
-# --- Helper functions for formatting are now in graphics_engine.py ---
 
 
 class PrometheusMonitorGenerator:
     """
-    Fetches system metrics from Prometheus and uses a graphics engine
-    to generate visualization frames.
+    Извлекает системные метрики из Prometheus и использует графический движок
+    для генерации кадров визуализации.
     """
     def __init__(self,
-                 prometheus_url=PROMETHEUS_URL,
-                 resolution=RESOLUTION,
-                 history_length=HISTORY_LENGTH,
-                 update_interval=UPDATE_INTERVAL,
-                 font_path=FONT_PATH,
-                 colors=COLORS, # Pass colors dict
-                 grid_layout=GRID_LAYOUT, # Pass layout
-                 metric_config=METRIC_CONFIG # Pass metric config
+                 resolution=DEFAULT_RESOLUTION,
+                 font_path=DEFAULT_FONT_PATH,
+                 colors=None, # Ожидается словарь, если None, используются DEFAULT_COLORS
+                 metric_config=None, # Ожидается словарь, если None, DEFAULT_METRIC_CONFIG
+                 grid_layout=None, # Ожидается список списков, если None, DEFAULT_GRID_LAYOUT
+                 title_font_size=DEFAULT_TITLE_FONT_SIZE,
+                 value_font_size=DEFAULT_VALUE_FONT_SIZE,
+                 unit_font_size=DEFAULT_UNIT_FONT_SIZE,
+                 prometheus_url=DEFAULT_PROMETHEUS_URL,
+                 history_length=DEFAULT_HISTORY_LENGTH,
+                 update_interval=DEFAULT_UPDATE_INTERVAL
                  ):
-        print("Initializing PrometheusMonitorGenerator...")
+        print("Инициализация PrometheusMonitorGenerator...")
         self.prometheus_url = prometheus_url
-        # Store graphics parameters needed for engine init
-        self.resolution = resolution
+        self.resolution = resolution # Разрешение холста для отрисовки
         self.history_length = history_length
         self.update_interval = update_interval
-        self._colors = colors # Keep a reference if needed elsewhere, or just pass
-        self._grid_layout = grid_layout # Keep if needed, or just pass
-        self._metric_config = metric_config # Keep reference
+
+        # Используем переданные конфигурации или значения по умолчанию
+        self._font_path = font_path
+        self._colors = colors if colors is not None else deepcopy(DEFAULT_COLORS)
+        self._metric_config = metric_config if metric_config is not None else deepcopy(DEFAULT_METRIC_CONFIG)
+        self._grid_layout = grid_layout if grid_layout is not None else deepcopy(DEFAULT_GRID_LAYOUT)
+        
+        # Размеры шрифтов
+        self._title_font_size = title_font_size
+        self._value_font_size = value_font_size
+        self._unit_font_size = unit_font_size
 
         self.prom = None
         try:
+            # Таймаут соединения можно настроить через custom_config={'timeout': 5}
             self.prom = PrometheusConnect(url=self.prometheus_url, disable_ssl=True)
-            # Initial connection check
             if not self.prom.check_prometheus_connection():
-                # Changed to warning, will try to reconnect in loop
-                print(f"Warning: Initial Prometheus connection check failed at {self.prometheus_url}. Will retry.")
-                # raise ConnectionError("Initial Prometheus connection check failed.") # Or raise error
+                print(f"ПРЕДУПРЕЖДЕНИЕ: Начальная проверка соединения с Prometheus не удалась по адресу {self.prometheus_url}. Попытки будут продолжены.")
             else:
-                 print(f"Successfully connected to Prometheus at {self.prometheus_url}")
+                 print(f"Успешное подключение к Prometheus по адресу {self.prometheus_url}")
         except Exception as e:
-            # Changed to warning, will try to reconnect in loop
-            print(f"Warning: Failed to connect or verify Prometheus at {self.prometheus_url}: {e}. Will retry.")
-            # print(f"CRITICAL ERROR: Failed to connect or verify Prometheus at {self.prometheus_url}: {e}") # Or raise
+            print(f"ПРЕДУПРЕЖДЕНИЕ: Не удалось подключиться или проверить Prometheus по адресу {self.prometheus_url}: {e}. Попытки будут продолжены.")
 
-        # Initialize metric data storage (remains the same)
+        # Инициализация хранения данных метрик
         self.metric_data = {}
-        for key, config in self._metric_config.items():
+        for key in self._metric_config.keys(): # Итерируемся по ключам из self._metric_config
              sub_metrics = []
              if key == "disk_usage":
                  sub_metrics = ['disk_read', 'disk_write']
-                 # Initialize dynamic range tracker for disk
-                 self.metric_data['disk_range_max'] = 10 * 1024 * 1024 # Initial 10 MB/s max
+                 self.metric_data['disk_range_max'] = 10 * 1024 * 1024 # Начальный максимум для диапазона диска: 10 МБ/с
              elif key == "ram_usage":
                  sub_metrics = ['ram_used', 'ram_total']
              else:
-                 sub_metrics = [key]
+                 sub_metrics = [key] # Для метрик с одним значением (gpu_load, cpu_load и т.д.)
 
              for sub_key in sub_metrics:
-                 # Use history_length for history, length 1 for static totals
+                 # Длина истории 1 для статичных значений (например, total RAM)
                  hist_len = 1 if 'total' in sub_key else self.history_length
-                 default_val = 0.0
+                 default_val = 0.0 if 'total' not in sub_key else 0.0 # Или другое значение для total, если нужно
                  self.metric_data[sub_key] = {
                      "history": deque([default_val] * hist_len, maxlen=hist_len),
                      "current": default_val
                  }
+        # Если disk_usage не в _metric_config, disk_range_max не будет создан, это нормально,
+        # graphics_engine должен будет это обработать (например, не использовать динамический диапазон для диска)
+        if 'disk_usage' not in self._metric_config and 'disk_range_max' in self.metric_data:
+            del self.metric_data['disk_range_max']
 
-        # --- Graphics Engine Initialization ---
+
+        # --- Инициализация графического движка ---
         try:
              self.graphics = MonitorGraphicsEngine(
                  resolution=self.resolution,
-                 font_path=font_path, # Pass font path
-                 colors=self._colors, # Pass colors
-                 grid_layout=self._grid_layout, # Pass layout
-                 metric_config=self._metric_config, # Pass metric config
-                 title_font_size=TITLE_FONT_SIZE, # Pass font sizes
-                 value_font_size=VALUE_FONT_SIZE,
-                 unit_font_size=UNIT_FONT_SIZE,
-                 history_length=self.history_length # Pass history length
+                 font_path=self._font_path,
+                 colors=self._colors,
+                 grid_layout=self._grid_layout,
+                 metric_config=self._metric_config,
+                 title_font_size=self._title_font_size,
+                 value_font_size=self._value_font_size,
+                 unit_font_size=self._unit_font_size,
+                 history_length=self.history_length
              )
         except (ValueError, RuntimeError, IOError) as e:
-             print(f"CRITICAL ERROR: Failed to initialize MonitorGraphicsEngine: {e}")
-             # Decide how to handle this - maybe raise the error, or set self.graphics = None
-             raise # Re-raise critical error
+             print(f"КРИТИЧЕСКАЯ ОШИБКА: Не удалось инициализировать MonitorGraphicsEngine: {e}")
+             raise # Перевыбрасываем критическую ошибку
 
-        # Threading setup (remains the same)
-        self._lock = threading.Lock()
-        self._stop_event = threading.Event()
+        # Настройка и запуск потока сбора данных
+        self._lock = threading.Lock() # Блокировка для доступа к self.metric_data
+        self._stop_event = threading.Event() # Событие для сигнала остановки потока
         self._data_thread = threading.Thread(target=self._data_collection_loop, daemon=True)
         self._data_thread.start()
-        print("Background data collection thread started.")
-        print("PrometheusMonitorGenerator initialized.")
-
-    # --- Font loading is now handled by MonitorGraphicsEngine ---
-    # def _load_font(self, font_size): ... removed ...
+        print("Фоновый поток сбора данных Prometheus запущен.")
+        print("PrometheusMonitorGenerator успешно инициализирован.")
 
     def _fetch_metric(self, query):
-        """Fetches a single metric value from Prometheus."""
-        # --- This method remains the same ---
+        """Извлекает одно значение метрики из Prometheus."""
         if not self.prom:
-            # print("Warning: Prometheus connection not available for fetch.")
-            return None # No connection object
-
-        # Try to reconnect or verify connection before query if needed
-        # try:
-        #     if not self.prom.check_prometheus_connection():
-        #         print("Warning: Prometheus connection lost, attempting query anyway...")
-        #         # Optionally try to re-establish connection here if possible
-        # except Exception as conn_err:
-        #      print(f"Warning: Error checking Prometheus connection before query: {conn_err}")
-        #      return None # Don't attempt query if check fails badly
-
+            # print("ПРЕДУПРЕЖДЕНИЕ: Соединение с Prometheus недоступно для извлечения метрики.")
+            return None 
 
         try:
             result = self.prom.custom_query(query=query)
-            # Basic validation of result structure
             if result and isinstance(result, list) and len(result) > 0 and \
                isinstance(result[0], dict) and 'value' in result[0] and \
                isinstance(result[0]['value'], (list, tuple)) and len(result[0]['value']) == 2:
-                # Extract value, attempt float conversion
-                raw_value = result[0]['value'][1]
+                raw_value = result[0]['value'][1] # Второе значение - это само значение метрики
                 try:
-                    # Handle potential 'NaN' string from Prometheus
                     if isinstance(raw_value, str) and raw_value.lower() == 'nan':
-                         return math.nan # Return actual NaN
+                         return math.nan 
                     return float(raw_value)
                 except (ValueError, TypeError):
-                     print(f"Warning: Could not convert value '{raw_value}' to float for query '{query}'.")
-                     return None # Conversion failed
+                     print(f"ПРЕДУПРЕЖДЕНИЕ: Не удалось конвертировать значение '{raw_value}' в float для запроса '{query}'.")
+                     return None
             else:
-                # print(f"Warning: No data or unexpected format received for query '{query}'. Result: {result}")
-                return None # No data or unexpected format
-        # More specific exceptions can be useful
-        except ConnectionError as e:
-            print(f"Warning: Prometheus connection error during query '{query}': {e}")
-            # Consider attempting reconnect here? For now, return None.
-            # self.prom = None # Maybe reset prom object?
+                # Запрос вернул данные, но не в ожидаемом формате, или пустой результат
+                # print(f"ПРЕДУПРЕЖДЕНИЕ: Нет данных или неожиданный формат для запроса '{query}'. Результат: {result}")
+                return None
+        except PrometheusApiClientException as e: # Специфичная ошибка клиента API
+            print(f"ОШИБКА API Prometheus при запросе '{query}': {e}")
+            # Можно попытаться переустановить соединение self.prom = None ?
+            return None
+        except ConnectionError as e: # requests.exceptions.ConnectionError
+            print(f"ОШИБКА СОЕДИНЕНИЯ Prometheus при запросе '{query}': {e}")
+            self.prom = None # Сбрасываем соединение, чтобы попытаться переподключиться в _data_collection_loop
             return None
         except Exception as e:
-            # Catch other potential errors from prometheus_api_client or network issues
-            print(f"Warning: Unexpected error fetching query '{query}': {type(e).__name__} - {e}")
+            print(f"ПРЕДУПРЕЖДЕНИЕ: Неожиданная ошибка при извлечении запроса '{query}': {type(e).__name__} - {e}")
             return None
 
     def _data_collection_loop(self):
-        """Background loop to fetch metrics periodically."""
-        # --- This method remains largely the same ---
-        # --- It updates self.metric_data                       ---
+        """Фоновый цикл для периодического извлечения метрик из Prometheus."""
+        print("Цикл сбора данных Prometheus запускается.")
         while not self._stop_event.is_set():
-            start_fetch_time = time.time()
-            fetched_data = {}
-            is_connected = False
-
-            # Check connection status (or try to connect if not connected)
+            loop_start_time = time.time()
+            
+            # Попытка (пере)подключения, если self.prom отсутствует
             if not self.prom:
-                 try:
-                      print("Attempting to establish Prometheus connection...")
-                      self.prom = PrometheusConnect(url=self.prometheus_url, disable_ssl=True)
-                      is_connected = self.prom.check_prometheus_connection()
-                      if is_connected: print("Prometheus connection established.")
-                      else: self.prom = None # Reset if check failed
-                 except Exception as e:
-                      print(f"Warning: Failed to establish Prometheus connection: {e}")
-                      self.prom = None
-                      is_connected = False
-            else:
-                 try:
-                      is_connected = self.prom.check_prometheus_connection()
-                      # if not is_connected: print("Warning: Prometheus connection check failed.")
-                 except Exception as e:
-                      print(f"Warning: Prometheus connection check failed: {e}")
-                      is_connected = False
-                      # Consider setting self.prom = None here?
-
-            # Fetch data only if connected
-            if is_connected:
-                for key, config in self._metric_config.items():
-                    if key == "disk_usage":
-                        fetched_data['disk_read'] = self._fetch_metric(config['query_read'])
-                        fetched_data['disk_write'] = self._fetch_metric(config['query_write'])
-                    elif key == "ram_usage":
-                        fetched_data['ram_used'] = self._fetch_metric(config['query_used'])
-                        fetched_data['ram_total'] = self._fetch_metric(config['query_total'])
+                try:
+                    print("Попытка установить/восстановить соединение с Prometheus...")
+                    self.prom = PrometheusConnect(url=self.prometheus_url, disable_ssl=True)
+                    if not self.prom.check_prometheus_connection():
+                        print(f"ПРЕДУПРЕЖДЕНИЕ: Попытка (пере)подключения к Prometheus не удалась.")
+                        self.prom = None # Оставляем None, если не удалось
                     else:
-                        fetched_data[key] = self._fetch_metric(config['query'])
-            else:
-                # If not connected, populate with None to show "N/A"
-                for key in self._metric_config.keys():
-                    value = None
+                        print("Соединение с Prometheus успешно установлено/восстановлено.")
+                except Exception as e:
+                    print(f"ПРЕДУПРЕЖДЕНИЕ: Ошибка при попытке (пере)подключения к Prometheus: {e}")
+                    self.prom = None
+
+            current_fetched_data = {}
+            if self.prom: # Запрашиваем данные только если есть соединение
+                for key, config_item in self._metric_config.items():
                     if key == "disk_usage":
-                         fetched_data['disk_read'] = value; fetched_data['disk_write'] = value
+                        current_fetched_data['disk_read'] = self._fetch_metric(config_item['query_read'])
+                        current_fetched_data['disk_write'] = self._fetch_metric(config_item['query_write'])
                     elif key == "ram_usage":
-                         fetched_data['ram_used'] = value; fetched_data['ram_total'] = value
-                    else: fetched_data[key] = value
-
-
-            # --- Update shared metric_data structure (same logic) ---
+                        current_fetched_data['ram_used'] = self._fetch_metric(config_item['query_used'])
+                        current_fetched_data['ram_total'] = self._fetch_metric(config_item['query_total'])
+                    else: # Для метрик с одним запросом
+                        current_fetched_data[key] = self._fetch_metric(config_item['query'])
+            else: # Если соединения нет, заполняем None
+                for key in self._metric_config.keys():
+                    if key == "disk_usage":
+                        current_fetched_data['disk_read'] = None; current_fetched_data['disk_write'] = None
+                    elif key == "ram_usage":
+                        current_fetched_data['ram_used'] = None; current_fetched_data['ram_total'] = None
+                    else: current_fetched_data[key] = None
+            
+            # Обновляем общую структуру self.metric_data под блокировкой
             with self._lock:
-                # Debug print
-                # print(f"DEBUG - Fetched this cycle: {fetched_data}")
+                for data_key, value in current_fetched_data.items():
+                    if data_key not in self.metric_data: 
+                        # Это может произойти, если _metric_config изменился, а self.metric_data еще не обновлен
+                        # print(f"ПРЕДУПРЕЖДЕНИЕ: Ключ '{data_key}' из запроса отсутствует в self.metric_data. Пропускается.")
+                        continue
 
-                for sub_key, value in fetched_data.items():
-                    if sub_key not in self.metric_data: continue # Skip unknown keys like 'disk_range_max'
-
-                    current_value_for_display = value # Keep None/NaN for display as "N/A"
-                    value_for_history = 0.0 # Default history value if fetch failed
-
-                    # Store the actual fetched value (even if None/NaN) as 'current'
-                    self.metric_data[sub_key]["current"] = current_value_for_display
-
-                    # Determine value for history (use 0.0 for None/NaN)
+                    # 'current' хранит фактическое значение (может быть None или NaN)
+                    self.metric_data[data_key]["current"] = value 
+                    
+                    # Для истории используем 0.0, если значение None или NaN
+                    value_for_history = 0.0
                     if value is not None and not (isinstance(value, float) and math.isnan(value)):
                         value_for_history = value
+                    
+                    if 'total' not in data_key: # Для временных рядов
+                        self.metric_data[data_key]["history"].append(value_for_history)
+                    else: # Для статических "total" значений (например, общий объем RAM)
+                        self.metric_data[data_key]["history"].clear()
+                        self.metric_data[data_key]["history"].append(value_for_history)
 
-                    # Update history deque (append non-total, replace total)
-                    if 'total' not in sub_key:
-                        self.metric_data[sub_key]["history"].append(value_for_history)
-                    else:
-                        # For totals (like RAM total), replace the deque content
-                        self.metric_data[sub_key]["history"].clear()
-                        self.metric_data[sub_key]["history"].append(value_for_history)
+                # Обновление динамического максимума для диапазона диска
+                if 'disk_usage' in self._metric_config: # Только если диск вообще настроен
+                    disk_read_val = self.metric_data.get('disk_read', {}).get('current')
+                    disk_write_val = self.metric_data.get('disk_write', {}).get('current')
+                    current_disk_max_range = self.metric_data.get('disk_range_max', 1.0) # Безопасное значение по умолчанию
+
+                    # Проверяем, что значения не None и не NaN
+                    valid_read = disk_read_val is not None and not math.isnan(disk_read_val)
+                    valid_write = disk_write_val is not None and not math.isnan(disk_write_val)
+
+                    if valid_read and disk_read_val > current_disk_max_range * 0.9:
+                        current_disk_max_range = disk_read_val * 1.2
+                    if valid_write and disk_write_val > current_disk_max_range * 0.9:
+                        current_disk_max_range = disk_write_val * 1.2
+                    
+                    # Можно добавить логику для медленного уменьшения current_disk_max_range, если значения долго остаются низкими
+                    # Например, если max(read_history + write_history) < current_disk_max_range * 0.5, то уменьшить.
+                    # Но для простоты пока только увеличиваем.
+                    # Минимальное значение, чтобы избежать слишком маленького диапазона
+                    self.metric_data['disk_range_max'] = max(current_disk_max_range, 1024 * 1024) # хотя бы 1MB/s
 
 
-                    # Update dynamic disk range maximum (remains same logic)
-                    if sub_key == 'disk_read' or sub_key == 'disk_write':
-                        current_max = self.metric_data.get('disk_range_max', 1.0) # Get current dynamic max
-                        # Increase max range if current value exceeds 90% of it
-                        if value is not None and not math.isnan(value) and value > current_max * 0.9:
-                            new_max = value * 1.2 # Set new max 20% above current value
-                            self.metric_data['disk_range_max'] = new_max
-                            # print(f"DEBUG: Increased disk_range_max to {new_max / 1024 / 1024 :.2f} MB/s")
-                        # Optional: Add logic to decrease max range slowly if values stay low?
-                        # E.g., if max(history) < current_max * 0.5 for a while, decrease current_max
-
-
-            # Calculate sleep time
-            fetch_duration = time.time() - start_fetch_time
+            # Ожидание до следующего интервала обновления
+            fetch_duration = time.time() - loop_start_time
             sleep_time = max(0, self.update_interval - fetch_duration)
-            # Use wait with timeout for better interrupt handling
-            self._stop_event.wait(sleep_time)
+            self._stop_event.wait(sleep_time) # Ждем с возможностью прерывания
 
-    # --- Drawing methods are removed ---
-    # def draw_sparkline_with_grid(...): ... removed ...
-    # def draw_frame(...): ... removed ...
+        print("Цикл сбора данных Prometheus остановлен.")
 
-    def generate_image_frame(self, target_image):
+    def generate_image_frame(self, target_image: Image.Image):
         """
-        Generates a monitor frame onto the target_image using the graphics engine.
+        Генерирует кадр монитора на предоставленном target_image, используя графический движок.
+        target_image - это PIL.Image объект, на котором будет производиться отрисовка.
         """
         if not hasattr(self, 'graphics') or self.graphics is None:
-             print("Error: Graphics engine not initialized.")
-             # Optionally draw an error message on the image
-             # draw = ImageDraw.Draw(target_image)
-             # draw.rectangle([0,0, *target_image.size], fill=self._colors['background'])
-             # draw.text((10,10), "Error: Graphics Engine Failed", fill=self._colors['error'])
-             return target_image # Return original or error image
+             print("ОШИБКА: Графический движок не инициализирован в PrometheusMonitorGenerator.")
+             # Можно нарисовать сообщение об ошибке на target_image
+             try:
+                draw = ImageDraw.Draw(target_image)
+                draw.rectangle([0,0, *target_image.size], fill=self._colors.get('background', (0,0,0)))
+                error_font = ImageFont.load_default() # Простой шрифт
+                draw.text((10,10), "Error: Graphics Engine Failed", fill=self._colors.get('error', (255,0,0)), font=error_font)
+             except Exception: pass # Если даже это не удалось
+             return target_image
 
-        # Get a thread-safe copy of the current data
+        # Получаем потокобезопасную копию текущих данных
+        data_copy_for_frame = {}
         with self._lock:
-            # Create a copy to pass to the drawing function.
-            # Shallow copy is usually okay if the drawing function doesn't modify
-            # nested structures deeply, but deepcopy is safest if unsure.
-            # Let's do a structured copy to be safe with deques.
-            data_copy = {}
-            for key, values in self.metric_data.items():
-                 if isinstance(values, dict) and "history" in values:
-                      # Explicitly copy the deque and the current value
-                      data_copy[key] = {
-                          "history": values["history"].copy(),
-                          "current": values["current"]
+            # Глубокое копирование, если есть вложенные изменяемые структуры (особенно deques)
+            for key, value_dict in self.metric_data.items():
+                 if isinstance(value_dict, dict) and "history" in value_dict and "current" in value_dict:
+                      data_copy_for_frame[key] = {
+                          "history": value_dict["history"].copy(), # Копируем deque
+                          "current": value_dict["current"]         # Копируем текущее значение
                           }
-                 else:
-                      # Copy other top-level items like 'disk_range_max'
-                      data_copy[key] = values
+                 else: # Для простых значений, как disk_range_max
+                      data_copy_for_frame[key] = value_dict 
 
-        # Call the graphics engine's draw method
+        # Вызываем метод отрисовки графического движка
         try:
-             self.graphics.draw_frame(target_image, data_copy)
+             self.graphics.draw_frame(target_image, data_copy_for_frame)
         except Exception as e:
-             print(f"Error during graphics engine draw_frame: {e}")
-             # Handle drawing error, maybe draw error message on image
+             print(f"ОШИБКА во время вызова self.graphics.draw_frame: {e}")
              import traceback
              traceback.print_exc()
+             # Можно также нарисовать сообщение об ошибке на изображении здесь
 
-        return target_image
+        return target_image # Возвращаем измененное изображение
 
-
-    # --- Lifecycle methods remain the same ---
     def stop(self):
-        """Stops the background data collection thread."""
-        print("\nStopping data collection thread...")
+        """Останавливает фоновый поток сбора данных."""
+        print("Остановка потока сбора данных PrometheusMonitorGenerator...")
         self._stop_event.set()
-        # Join the thread with a timeout
         if hasattr(self, '_data_thread') and self._data_thread.is_alive():
-            self._data_thread.join(timeout=max(1.0, self.update_interval * 2)) # Wait longer
-        # Check if join succeeded
+            # Таймаут, чтобы не блокировать основной поток надолго
+            self._data_thread.join(timeout=max(1.0, self.update_interval * 2 + 1)) 
         if hasattr(self, '_data_thread') and self._data_thread.is_alive():
-            print("Warning: Data collection thread did not stop gracefully.")
+            print("ПРЕДУПРЕЖДЕНИЕ: Поток сбора данных Prometheus не остановился корректно.")
         else:
-            print("Data collection thread stopped.")
+            print("Поток сбора данных Prometheus остановлен.")
 
+    # --- Для использования с 'with' (если нужно) ---
     def __enter__(self):
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.stop()
 
-# --- Example Usage (Updated) ---
+# --- Пример использования (если запускать этот файл напрямую) ---
 if __name__ == "__main__":
-    print("Starting Prometheus Monitor Example...")
-    monitor_instance = None # Define outside try for finally block
-    try:
-        # Create the monitor instance (which also creates the graphics engine)
-        # Configuration is read from constants defined above
-        monitor_instance = PrometheusMonitorGenerator()
+    print("Запуск примера Prometheus Monitor Generator...")
+    # Для копирования вложенных словарей при использовании значений по умолчанию
+    from copy import deepcopy 
 
-        # Create the initial blank image canvas
-        img = Image.new('RGB', RESOLUTION, color=COLORS["background"])
+    monitor_instance = None 
+    try:
+        # Создаем экземпляр генератора (он также создает графический движок)
+        # Конфигурация берется из констант, определенных выше в этом файле,
+        # или может быть передана в конструктор.
+        monitor_instance = PrometheusMonitorGenerator(
+            # Здесь можно переопределить параметры, например:
+            # resolution=(320,240),
+            # prometheus_url="http://другой-прометеус:9090",
+            # title_font_size=16 
+        )
+
+        # Создаем начальный пустой холст изображения
+        # Разрешение должно соответствовать разрешению, с которым был инициализирован генератор
+        img_canvas = Image.new('RGB', monitor_instance.resolution, color=monitor_instance._colors.get("background", (0,0,0)))
 
         frame_count = 0
-        max_frames = 120 # Generate 120 frames (2 minutes)
-        print(f"Generating up to {max_frames} frames (press Ctrl+C to stop)...")
+        max_frames_to_generate = 10 # Сгенерируем 10 кадров для примера
+        print(f"Генерация до {max_frames_to_generate} кадров (нажмите Ctrl+C для остановки)...")
 
-        while frame_count < max_frames:
-            start_time = time.time()
+        while frame_count < max_frames_to_generate:
+            start_render_time = time.time()
 
-            # Use the new method to generate the frame content
-            monitor_instance.generate_image_frame(img)
+            # Используем метод для генерации содержимого кадра
+            monitor_instance.generate_image_frame(img_canvas)
 
-            # Save or display the frame
+            # Сохраняем или отображаем кадр
             try:
-                # Save the generated frame
-                img.save(f"monitor_frame_{frame_count:03d}.png")
-                print(f"\rGenerated frame: {frame_count+1}/{max_frames}", end="")
+                img_canvas.save(f"prometheus_monitor_frame_{frame_count:03d}.png")
+                print(f"\rСгенерирован кадр: {frame_count+1}/{max_frames_to_generate}", end="")
             except Exception as e:
-                print(f"\nError saving image frame: {e}")
-                # Decide if loop should break on save error
+                print(f"\nОшибка сохранения кадра изображения: {e}")
+                # Решить, должен ли цикл прерываться при ошибке сохранения
 
             frame_count += 1
 
-            # Wait appropriately before the next frame
-            elapsed = time.time() - start_time
-            # Use the monitor's update interval as the target frame rate
-            sleep_time = max(0, monitor_instance.update_interval - elapsed)
-            time.sleep(sleep_time)
+            # Ожидаем перед следующим кадром
+            elapsed_time = time.time() - start_render_time
+            # Используем интервал обновления монитора как целевую частоту кадров
+            sleep_duration = max(0, monitor_instance.update_interval - elapsed_time)
+            time.sleep(sleep_duration)
+            
+            if monitor_instance._stop_event.is_set(): # Если поток сбора данных остановился
+                print("\nПоток сбора данных был остановлен, прекращаем генерацию.")
+                break
 
-        print("\nFinished generating frames.")
 
-    # Handle specific errors if needed
-    except ConnectionError as e:
-         print(f"\nConnection Error: {e}")
-    except RuntimeError as e:
-         print(f"\nRuntime Error: {e}")
+        print("\nЗавершение генерации кадров.")
+
+    except ConnectionError as e: # Если Prometheus недоступен при инициализации
+         print(f"\nОшибка соединения: {e}")
+    except RuntimeError as e: # Например, ошибка инициализации graphics_engine
+         print(f"\nОшибка выполнения: {e}")
     except KeyboardInterrupt:
-        print("\nInterrupted by user.")
+        print("\nПрервано пользователем.")
     except Exception as e:
-        # Catch-all for unexpected errors
-        print(f"\nAn unexpected error occurred: {type(e).__name__} - {e}")
+        print(f"\nПроизошла непредвиденная ошибка: {type(e).__name__} - {e}")
         import traceback
-        traceback.print_exc() # Print full traceback for debugging
+        traceback.print_exc()
     finally:
-        # Ensure the monitor thread is stopped even if errors occurred
         if monitor_instance:
-            print("Ensuring monitor is stopped...")
+            print("Обеспечение остановки монитора...")
             monitor_instance.stop()
-        print("Monitor example finished.")
+        print("Пример Prometheus Monitor Generator завершен.")
