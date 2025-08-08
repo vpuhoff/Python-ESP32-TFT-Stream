@@ -40,14 +40,6 @@ default_pipeline_settings:
   prometheus_title_font_size: 18
   prometheus_value_font_size: 36
   prometheus_unit_font_size: 20
-  prometheus_colors:                       # Цветовая схема по умолчанию
-    background: [10, 15, 25]               # Темно-синий/серый
-    foreground: [200, 220, 220]            # Светло-серый/голубой текст
-    value_color: [0, 255, 255]             # Яркий циан для значений
-    graph_line: [0, 200, 220]              # Цвет линии графика
-    grid_lines: [60, 80, 100]              # Цвет линий сетки
-    cell_border: [50, 70, 90]              # Цвет границ ячеек
-    error: [255, 80, 80]                   # Цвет для ошибок
   # Конфигурация метрик и сетки для Prometheus монитора по умолчанию
   # Эта структура должна соответствовать ожиданиям PrometheusMonitorGenerator
   prometheus_metric_config:
@@ -78,15 +70,24 @@ default_pipeline_settings:
 
 # Список конфигураций для каждого пайплайна
 pipelines:
-  - name: "Prometheus_Dashboard_ESP32"
+  # - name: "Prometheus_Dashboard_ESP32"
+  #   esp32_port: 8888
+  #   target_width: 320  # Стандартное разрешение для многих TFT
+  #   target_height: 240
+  #   image_source_mode: "PROMETHEUS_MONITOR"
+  #   prometheus_title_font_size: 12
+  #   prometheus_value_font_size: 12
+  #   prometheus_unit_font_size: 12
+  #   prometheus_font_path: "arial.ttf"
+  - name: "WindowCap_Dashboard_ESP32"
     esp32_port: 8888
     target_width: 320  # Стандартное разрешение для многих TFT
     target_height: 240
-    image_source_mode: "PROMETHEUS_MONITOR"
-    prometheus_title_font_size: 12
-    prometheus_value_font_size: 12
-    prometheus_unit_font_size: 12
-    prometheus_font_path: "cour.ttf"
+    image_source_mode: "WINDOW_CAPTURE"
+    window_title: "Картинка в картинке"
+    #window_class: "Intermediate D3D Window"
+
+
     # Переопределяем только то, что отличается от default_pipeline_settings
     # Например, если хотим другую частоту обновления для этого конкретного дашборда:
     # prometheus_update_interval: 0.8
@@ -98,30 +99,30 @@ pipelines:
     # Можно также переопределить шрифты или цвета для этого пайплайна, если нужно.
     # prometheus_title_font_size: 16 # Чуть меньше для этого экрана
 
-  - name: "ScreenCap_PrimaryMonitor_Mini"
-    esp32_port: 8889
-    target_width: 160  # Меньшее разрешение для захвата экрана
-    target_height: 128
-    image_source_mode: "PROMETHEUS_MONITOR"
-    # Обязательно указываем область захвата для этого режима
-    capture_region: {top: 120, left: 1200, width: 160, height: 128, mon: 1} # Захватываем 480x320 и масштабируем до 240x160
-    # Можно изменить параметры производительности для этого пайплайна
-    target_fps: 20.0 # Попытаемся достичь более высокого FPS для захвата экрана
-    min_dirty_rect_threshold: 15
-    max_dirty_rect_threshold: 180
-    gamma: 1.9
-    wb_scale: [0.99, 0.99, 0.99]
-    prometheus_title_font_size: 16
-    prometheus_value_font_size: 16
-    prometheus_unit_font_size: 16
-    prometheus_font_path: "cour.ttf"
+  # - name: "ScreenCap_PrimaryMonitor_Mini"
+  #   esp32_port: 8888
+  #   target_width: 320  # Меньшее разрешение для захвата экрана
+  #   target_height: 240
+  #   image_source_mode: "SCREEN_CAPTURE"
+  #   # Обязательно указываем область захвата для этого режима
+  #   capture_region: {top: 120, left: 1200, width: 160, height: 128, mon: 1} # Захватываем 480x320 и масштабируем до 240x160
+  # #   # Можно изменить параметры производительности для этого пайплайна
+  #   target_fps: 20.0 # Попытаемся достичь более высокого FPS для захвата экрана
+  #   min_dirty_rect_threshold: 15
+  #   max_dirty_rect_threshold: 180
+  #   gamma: 1.9
+  #   wb_scale: [0.99, 0.99, 0.99]
+  #   prometheus_title_font_size: 16
+  #   prometheus_value_font_size: 16
+  #   prometheus_unit_font_size: 16
+  #   prometheus_font_path: "cour.ttf"
     
-    prometheus_metric_config:
-      gpu_load: 
-        title: "Frames per Second"
-        query: 'avg_over_time(esp32_consumer_calculated_fps{pipeline_name="Prometheus_Dashboard_ESP32"}[1m]) or on() vector(0)'
-        unit: " fps"
-        range: [0, 100]
-        color: [0,0,255]
-    prometheus_grid_layout: # Сетка отображения метрик
-      - ["gpu_load"]
+  #   prometheus_metric_config:
+  #     gpu_load: 
+  #       title: "Frames per Second"
+  #       query: 'avg_over_time(esp32_consumer_calculated_fps{pipeline_name="Prometheus_Dashboard_ESP32"}[1m]) or on() vector(0)'
+  #       unit: " fps"
+  #       range: [0, 100]
+  #       color: [0,0,255]
+  #   prometheus_grid_layout: # Сетка отображения метрик
+  #     - ["gpu_load"]

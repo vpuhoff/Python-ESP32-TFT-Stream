@@ -8,19 +8,81 @@ import struct
 import numpy as np
 from collections import deque
 import mss # Для SCREEN_CAPTURE
+from numba import jit, types
+
 
 # Импорт ваших генераторов
 # Убедитесь, что эти файлы находятся в том же каталоге или доступны через PYTHONPATH
 from bios_drawer import draw_bios_on_image
 from cpu_monitor_generator import CpuMonitorGenerator
 from prometheus_monitor_generator import PrometheusMonitorGenerator
+from window_capture import WindowScreenshotter
+
 # from graphics_engine import MonitorGraphicsEngine # Если используется напрямую
 
 # Вспомогательная функция для преобразования RGB в RGB565
+@jit(nopython=True)
 def rgb_to_rgb565(r, g, b):
     """Преобразует значения R, G, B в 16-битный формат RGB565."""
     return ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3)
 
+# The decorator's return type signature is now corrected
+@jit(types.UniTuple(types.UniTuple(types.float32, 3), 2)(types.float32, types.float32, types.float32), nopython=True)
+def _quantize_and_get_error_numba(r, g, b):
+    # This part of the code remains the same as the logic is sound
+    
+    new_r = round(r / 8.0) * 8.0
+    if new_r < 0.0: new_r = 0.0
+    if new_r > 255.0: new_r = 255.0
+
+    new_g = round(g / 4.0) * 4.0
+    if new_g < 0.0: new_g = 0.0
+    if new_g > 255.0: new_g = 255.0
+    
+    new_b = round(b / 8.0) * 8.0
+    if new_b < 0.0: new_b = 0.0
+    if new_b > 255.0: new_b = 255.0
+    
+    error_r = r - new_r
+    error_g = g - new_g
+    error_b = b - new_b
+    
+    # The return statement's structure remains correct
+    return (new_r, new_g, new_b), (error_r, error_g, error_b)
+
+# This function remains without changes
+@jit(nopython=True)
+def _apply_dithering_numba(pixels, width, height):
+    for y in range(height):
+        for x in range(width):
+            old_r, old_g, old_b = pixels[y, x]
+            
+            (new_r, new_g, new_b), (error_r, error_g, error_b) = _quantize_and_get_error_numba(old_r, old_g, old_b)
+            
+            pixels[y, x] = (new_r, new_g, new_b)
+            
+            if x < width - 1:
+                pixels[y, x + 1, 0] += error_r * 7 / 16.0
+                pixels[y, x + 1, 1] += error_g * 7 / 16.0
+                pixels[y, x + 1, 2] += error_b * 7 / 16.0
+            
+            if y < height - 1:
+                if x > 0:
+                    pixels[y + 1, x - 1, 0] += error_r * 3 / 16.0
+                    pixels[y + 1, x - 1, 1] += error_g * 3 / 16.0
+                    pixels[y + 1, x - 1, 2] += error_b * 3 / 16.0
+                
+                pixels[y + 1, x, 0] += error_r * 5 / 16.0
+                pixels[y + 1, x, 1] += error_g * 5 / 16.0
+                pixels[y + 1, x, 2] += error_b * 5 / 16.0
+                
+                if x < width - 1:
+                    pixels[y + 1, x + 1, 0] += error_r * 1 / 16.0
+                    pixels[y + 1, x + 1, 1] += error_g * 1 / 16.0
+                    pixels[y + 1, x + 1, 2] += error_b * 1 / 16.0
+
+
+            
 class StreamPipeline:
     """
     Управляет одним потоковым пайплайном: прослушивание порта, генерация кадров,
@@ -93,7 +155,10 @@ class StreamPipeline:
                     value_font_size=self.config.get('prometheus_value_font_size', 36),
                     unit_font_size=self.config.get('prometheus_unit_font_size', 20),
                 )
-            elif source_mode == "SCREEN_CAPTURE":
+            elif source_mode == "WINDOW_CAPTURE":
+                self._generator_instance = WindowScreenshotter(self.config.get('window_title', None),
+                                                               self.config.get('crop_alignment', 'left'))
+            elif source_mode == "SCREEN_CAPTURE": 
                 capture_region = self.config.get('capture_region')
                 if not capture_region:
                     self._log("capture_region не указан для режима SCREEN_CAPTURE!", "ERROR")
@@ -134,6 +199,39 @@ class StreamPipeline:
         # Способ 1: Явное присваивание (возможно, безопаснее)
 
         return Image.fromarray(img_final_np, 'RGB')
+
+    def _apply_dithering_to_rgb565_bytes(self, img: Image.Image) -> bytes:
+        processing_start_time = time.monotonic()
+        try:
+            processed_img = self._apply_gamma_and_white_balance(img)
+        except Exception as e:
+            self._log(f"Ошибка при применении гаммы/ББ: {e}. Используется исходное изображение.", "WARN")
+            processed_img = img.convert('RGB') if img.mode != 'RGB' else img
+        self.metrics['frame_processing_time'].labels(stage='color_correction', pipeline_name=self.name).observe(time.monotonic() - processing_start_time)
+
+        conversion_start_time = time.monotonic()
+
+        if processed_img.mode != 'RGB':
+            processed_img = processed_img.convert('RGB')
+        
+        pixels = np.array(processed_img, dtype=np.float32)
+        width, height = processed_img.size
+        
+        _apply_dithering_numba(pixels, width, height)
+        
+        pixels = np.clip(pixels, 0, 255).astype(np.uint8)
+        r, g, b = pixels[:, :, 0], pixels[:, :, 1], pixels[:, :, 2]
+        
+        rgb565_val = ((r >> 3).astype(np.uint16) << 11) | \
+                    ((g >> 2).astype(np.uint16) << 5)  | \
+                    (b >> 3).astype(np.uint16)
+
+        byte_data = rgb565_val.astype('>H').tobytes()
+        
+        self.metrics['frame_processing_time'].labels(stage='rgb565_conversion', pipeline_name=self.name).observe(time.monotonic() - conversion_start_time)
+
+        return byte_data
+
 
     def _image_to_rgb565_bytes(self, img: Image.Image) -> bytes:
         """Конвертирует PIL Image в байты RGB565 после применения коррекций."""
@@ -262,7 +360,7 @@ class StreamPipeline:
                     elif source_mode == "BIOS":
                         generated_image = Image.new('RGB', canvas_resolution)
                         draw_bios_on_image(generated_image) # TODO: Передать параметры шрифта/цветов из config если нужно
-                    elif self._generator_instance: # CPU_MONITOR или PROMETHEUS_MONITOR
+                    elif self._generator_instance: # CPU_MONITOR или PROMETHEUS_MONITOR или WINDOW_CAPTURE
                         if self._generator_instance.resolution != canvas_resolution and source_mode != "PROMETHEUS_MONITOR": # Prometheus может иметь свою логику разрешения
                              self._log(f"Разрешение генератора ({source_mode}) {self._generator_instance.resolution} не совпадает с целевым холстом {canvas_resolution}!", "WARN")
                         
@@ -393,7 +491,7 @@ class StreamPipeline:
                                 if actual_chunk_h <= 0: continue
 
                                 chunk_img_to_send = img_resized.crop((x, y + current_y_offset, x + w, y + current_y_offset + actual_chunk_h))
-                                chunk_data_bytes = self._image_to_rgb565_bytes(chunk_img_to_send)
+                                chunk_data_bytes = self._apply_dithering_to_rgb565_bytes(chunk_img_to_send)
                                 if not chunk_data_bytes: continue
 
                                 packet_to_send = self._pack_update_packet(x, y + current_y_offset, w, actual_chunk_h, chunk_data_bytes)
@@ -409,7 +507,7 @@ class StreamPipeline:
                             if socket_error_this_frame: break
                         else: 
                             region_img_to_send = img_resized.crop((x,y, x+w, y+h))
-                            region_data_bytes = self._image_to_rgb565_bytes(region_img_to_send)
+                            region_data_bytes = self._apply_dithering_to_rgb565_bytes(region_img_to_send)
                             if not region_data_bytes: continue
 
                             packet_to_send = self._pack_update_packet(x,y,w,h,region_data_bytes)
