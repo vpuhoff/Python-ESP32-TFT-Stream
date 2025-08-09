@@ -128,6 +128,8 @@ void loop() {
 
         // Попытка подключения
         if (client.connect(server_ip, server_port)) {
+            client.setNoDelay(true);
+            client.setTimeout(5);     
             Serial.println("Connected to server!");
             // УСПЕХ: Сброс счетчика неудач
             connection_failure_count = 0;
@@ -235,7 +237,9 @@ void loop() {
              if (readExact(client, pixelBuffer, dataLen)) {
                  // Отображаем полученную область
                  // Данные в pixelBuffer должны быть RGB565 (по 2 байта на пиксель)
+                 tft.startWrite();
                  tft.pushImage(x, y, w, h, (uint16_t*)pixelBuffer);
+                 tft.endWrite();
                  // Debug: можно раскомментировать
                  // Serial.printf("Displayed image at (%u, %u) size %ux%u\n", x, y, w, h);
              } else {
@@ -248,7 +252,7 @@ void loop() {
 
     } else {
       // Недостаточно данных для заголовка, ждем
-      delay(1); // Небольшая пауза, чтобы не загружать CPU на 100%
+      yield(); // Небольшая пауза, чтобы не загружать CPU на 100%
     }
 
      yield(); // Даем шанс поработать другим процессам (WiFi и т.д.)
